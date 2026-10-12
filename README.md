@@ -1,4 +1,4 @@
-![alt text](assets/iconin.png)
+![icon](assets/iconin.png)
 
 # Hikari
 
@@ -6,6 +6,9 @@
 
 当前第一阶段是 Pi agent 与 GPUI 接入：工具 loop、Chat Completions / Responses / Anthropic 协议、stdio / Streamable HTTP MCP、Skill 发现与按需加载、会话恢复。运行 `cargo run -p hikari`。实现范围、Pi 代码来源和配置说明见 [Pi 接入文档](docs/pi-port.md)。Hindsight Memory Core 尚待实现。
 
+
+## visual
+![page1](assets/page1.png)
 
 ## License
 MIT
