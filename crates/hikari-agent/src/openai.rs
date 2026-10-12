@@ -83,16 +83,25 @@ pub fn chat_completions_url(base: &str) -> String {
     }
 }
 
-fn allows_empty_key(endpoint: &str) -> bool {
-    let lower = endpoint.to_ascii_lowercase();
-    lower.contains("://localhost") || lower.contains("://127.0.0.1") || lower.contains("://[::1]")
+pub(crate) fn allows_empty_key(endpoint: &str) -> bool {
+    let authority = endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest.split('/').next().unwrap_or(""))
+        .unwrap_or("");
+    authority == "localhost"
+        || authority.starts_with("localhost:")
+        || authority == "127.0.0.1"
+        || authority.starts_with("127.0.0.1:")
+        || authority == "[::1]"
+        || authority.starts_with("[::1]:")
 }
 
-fn request_body(model: &str, context: &Context<'_>) -> Value {
+pub(crate) fn request_body(model: &str, context: &Context<'_>) -> Value {
     let mut body = json!({
         "model": model,
         "stream": true,
         "messages": wire_messages(context.system_prompt, context.messages),
+        "stream_options": { "include_usage": true },
     });
     if !context.tools.is_empty() {
         body["tools"] = Value::Array(context.tools.iter().map(wire_tool).collect());
@@ -116,6 +125,7 @@ fn wire_messages(system: &str, messages: &[Message]) -> Vec<Value> {
     for message in messages {
         match message {
             Message::User { text } => out.push(json!({"role": "user", "content": text})),
+            Message::ContextSummary { text } => out.push(json!({"role":"system","content":text})),
             Message::Assistant {
                 text, tool_calls, ..
             } => {

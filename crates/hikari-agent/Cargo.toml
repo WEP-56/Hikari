@@ -9,3 +9,8 @@ description = "Small agent loop for Hikari. Memory stays outside the provider."
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2.12", default-features = true, features = ["json"] }
+memchr = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

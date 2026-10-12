@@ -1,5 +1,7 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use crate::memory::{ConsolidateState, Memory, RecallItem, RetainState};
 use crate::model::{Message, ToolCall, Usage};
@@ -26,9 +28,42 @@ pub struct TurnRequest {
     pub max_tool_rounds: usize,
 }
 
+/// Pi's steering/follow-up boundary: steering after tools, follow-up after a reply.
+#[derive(Default)]
+pub struct TurnControl {
+    queues: Mutex<(VecDeque<String>, VecDeque<String>)>,
+}
+impl TurnControl {
+    pub fn steer(&self, text: impl Into<String>) {
+        self.queues.lock().unwrap().0.push_back(text.into());
+    }
+    pub fn follow_up(&self, text: impl Into<String>) {
+        self.queues.lock().unwrap().1.push_back(text.into());
+    }
+    pub fn pending(&self) -> usize {
+        let queues = self.queues.lock().unwrap();
+        queues.0.len() + queues.1.len()
+    }
+    fn take_steering(&self) -> Vec<String> {
+        self.queues.lock().unwrap().0.drain(..).collect()
+    }
+    fn take_follow_up(&self) -> Option<String> {
+        self.queues.lock().unwrap().1.pop_front()
+    }
+    pub fn drain_pending(&self) -> Vec<String> {
+        let mut queues = self.queues.lock().unwrap();
+        let mut pending: Vec<_> = queues.0.drain(..).collect();
+        pending.extend(queues.1.drain(..));
+        pending
+    }
+}
+
 /// 前端只看这些事件。记忆三条都是主机发的，不是模型输出。
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
+    InputDelivered {
+        text: String,
+    },
     MessageStart {
         message: Message,
     },
@@ -58,6 +93,7 @@ pub enum AgentEvent {
         messages: Vec<Message>,
         error: Option<String>,
         usage: Usage,
+        retained_until: usize,
     },
     AutoCompactionStart {
         reason: String,
@@ -108,7 +144,18 @@ pub fn companion_prompt(name: &str, thinking: &str) -> String {
 }
 
 /// 跑完用户这一轮：召回只改这一次的系统提示，工具结果写回 session，结束后才 retain。
-pub fn run_turn(host: &TurnHost, mut request: TurnRequest, mut on_event: impl FnMut(AgentEvent)) {
+pub fn run_turn(host: &TurnHost, request: TurnRequest, on_event: impl FnMut(AgentEvent)) {
+    run_turn_with_control(host, request, &TurnControl::default(), on_event);
+}
+
+pub fn run_turn_with_control(
+    host: &TurnHost,
+    mut request: TurnRequest,
+    control: &TurnControl,
+    mut on_event: impl FnMut(AgentEvent),
+) {
+    request.max_tool_rounds =
+        crate::pi::iterations::clamp_max_tool_iterations(Some(request.max_tool_rounds));
     if request.retained_until > request.messages.len() {
         request.retained_until = request.messages.len();
     }
@@ -117,6 +164,11 @@ pub fn run_turn(host: &TurnHost, mut request: TurnRequest, mut on_event: impl Fn
     let mut last_assistant = Message::assistant("");
     let mut error = None;
     let mut rounds = 0usize;
+    let mut recovery = crate::pi::turn_recovery::TurnRecoveryState::new(
+        crate::pi::turn_recovery::TurnRecoveryMode::Conservative,
+    );
+    let mut pause_continuations = 0;
+    let mut handoff_warned = false;
 
     loop {
         if host.abort.load(Ordering::Relaxed) {
@@ -125,6 +177,12 @@ pub fn run_turn(host: &TurnHost, mut request: TurnRequest, mut on_event: impl Fn
                 push_assistant(&mut request, &mut last_assistant, "已停下。", &mut on_event);
             }
             break;
+        }
+
+        for text in control.take_steering() {
+            on_event(AgentEvent::InputDelivered { text: text.clone() });
+            request.query = text.clone();
+            request.messages.push(Message::user(text));
         }
 
         // 窗口满之前先把还没提交的原文交出去，再丢掉旧消息。摘要不会写进 session。
@@ -168,6 +226,7 @@ pub fn run_turn(host: &TurnHost, mut request: TurnRequest, mut on_event: impl Fn
                     draft.usage = Usage { input, output };
                 }
                 StreamEvent::Done(reason) => draft.stop = reason,
+                StreamEvent::Metadata(metadata) => draft.metadata = Some(metadata),
             }
             if !draft.text.is_empty() || !draft.thinking.is_empty() {
                 if !started {
@@ -221,13 +280,67 @@ pub fn run_turn(host: &TurnHost, mut request: TurnRequest, mut on_event: impl Fn
             Message::Assistant { tool_calls, .. } => tool_calls.clone(),
             _ => Vec::new(),
         };
-        if calls.is_empty() || error.is_some() || host.abort.load(Ordering::Relaxed) {
+        if error.is_some()
+            || host.abort.load(Ordering::Relaxed)
+            || draft.stop == crate::model::StopReason::Error
+        {
+            if draft.stop == crate::model::StopReason::Error && error.is_none() {
+                error = Some("模型未能完成本轮请求".into());
+            }
+            for call in &calls {
+                request.messages.push(Message::tool_result(
+                    &call.id,
+                    &call.name,
+                    "调用未执行：本轮已中断",
+                    true,
+                ));
+            }
             if host.abort.load(Ordering::Relaxed) {
                 error = Some("已停下。".to_string());
             }
             break;
         }
+        // Pi resubmits pause_turn verbatim; these are server tools, not local calls.
+        if draft.stop == crate::model::StopReason::PauseTurn {
+            if pause_continuations < 3 {
+                pause_continuations += 1;
+                continue;
+            }
+            error = Some("模型暂停的续接次数已达上限".into());
+            break;
+        }
+        if calls.is_empty() {
+            if let Some(action) = recovery.evaluate(draft.stop, &draft.text) {
+                request.messages.push(Message::user(action.nudge_text));
+                continue;
+            }
+            if let Some(text) = control.take_follow_up() {
+                on_event(AgentEvent::TurnEnd {
+                    message: last_assistant.clone(),
+                    tool_results: std::mem::take(&mut tool_results),
+                });
+                retain_new(host, &mut request, &mut on_event);
+                on_event(AgentEvent::InputDelivered { text: text.clone() });
+                request.query = text.clone();
+                request.messages.push(Message::user(text));
+                recovery = crate::pi::turn_recovery::TurnRecoveryState::new(
+                    crate::pi::turn_recovery::TurnRecoveryMode::Conservative,
+                );
+                rounds = 0;
+                handoff_warned = false;
+                continue;
+            }
+            break;
+        }
         if rounds >= request.max_tool_rounds {
+            for call in &calls {
+                request.messages.push(Message::tool_result(
+                    &call.id,
+                    &call.name,
+                    "工具轮数已达上限，调用未执行",
+                    true,
+                ));
+            }
             push_assistant(
                 &mut request,
                 &mut last_assistant,
@@ -240,7 +353,13 @@ pub fn run_turn(host: &TurnHost, mut request: TurnRequest, mut on_event: impl Fn
         for call in calls {
             if host.abort.load(Ordering::Relaxed) {
                 error = Some("已停下。".to_string());
-                break;
+                request.messages.push(Message::tool_result(
+                    &call.id,
+                    &call.name,
+                    "调用未执行：用户已取消",
+                    true,
+                ));
+                continue;
             }
             let arguments = if call.arguments.trim().is_empty() {
                 "{}".to_string()
@@ -252,10 +371,14 @@ pub fn run_turn(host: &TurnHost, mut request: TurnRequest, mut on_event: impl Fn
                 tool_name: call.name.clone(),
                 args: arguments.clone(),
             });
-            let (text, is_error) = match host.tools.call(&call.name, &arguments) {
-                Ok(text) => (text, false),
-                Err(err) => (err, true),
-            };
+            let (text, is_error) =
+                match host
+                    .tools
+                    .call_with_abort(&call.name, &arguments, &host.abort)
+                {
+                    Ok(text) => (text, false),
+                    Err(err) => (err, true),
+                };
             let result = Message::tool_result(&call.id, &call.name, text.clone(), is_error);
             on_event(AgentEvent::ToolExecutionEnd {
                 tool_call_id: call.id,
@@ -265,6 +388,20 @@ pub fn run_turn(host: &TurnHost, mut request: TurnRequest, mut on_event: impl Fn
             });
             tool_results.push(result.clone());
             request.messages.push(result);
+        }
+        if !handoff_warned
+            && crate::pi::iterations::should_warn_at_iteration_threshold(
+                rounds,
+                request.max_tool_rounds,
+            )
+        {
+            handoff_warned = true;
+            request.messages.push(Message::user(
+                crate::pi::iterations::iteration_handoff_steering_text(
+                    rounds,
+                    request.max_tool_rounds,
+                ),
+            ));
         }
     }
 
@@ -277,6 +414,7 @@ pub fn run_turn(host: &TurnHost, mut request: TurnRequest, mut on_event: impl Fn
         messages: request.messages,
         error,
         usage,
+        retained_until: request.retained_until,
     });
 }
 
@@ -359,8 +497,54 @@ fn maybe_compact(
     on_event(AgentEvent::AutoCompactionStart {
         reason: "窗口快满了".to_string(),
     });
+    // Pi checkpoint compaction: summarize first, then replace the old window.
+    // The summary is a derived context message and never an input to retain.
+    let transcript = serde_json::to_string(&request.messages[..cut]).map_err(|e| e.to_string())?;
+    let previous = request.messages[..cut]
+        .iter()
+        .filter_map(|m| match m {
+            Message::ContextSummary { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt = if previous.is_empty() {
+        crate::pi::compaction::SUMMARIZATION_PROMPT
+    } else {
+        crate::pi::compaction::UPDATE_SUMMARIZATION_PROMPT
+    };
+    let summary_request = [Message::user(format!(
+        "{prompt}\n<previous-summary>{previous}</previous-summary>\nConversation:\n{transcript}"
+    ))];
+    let context = Context {
+        system_prompt: crate::pi::compaction::SUMMARIZATION_SYSTEM_PROMPT,
+        messages: &summary_request,
+        tools: &[],
+    };
+    let mut summary = String::new();
+    let result = host.provider.stream(&context, &host.abort, &mut |event| {
+        if let StreamEvent::Text(text) = event {
+            summary.push_str(&text);
+        }
+    });
+    if let Err(err) = result {
+        on_event(AgentEvent::AutoCompactionEnd {
+            error: Some(err.message.clone()),
+        });
+        return Err(err.message);
+    }
+    if summary.trim().is_empty() || host.abort.load(Ordering::Relaxed) {
+        let error = "上下文摘要未完成，原文已保留".to_string();
+        on_event(AgentEvent::AutoCompactionEnd {
+            error: Some(error.clone()),
+        });
+        return Err(error);
+    }
     request.messages.drain(..cut);
-    request.retained_until = request.retained_until.saturating_sub(cut);
+    request
+        .messages
+        .insert(0, Message::ContextSummary { text: summary });
+    request.retained_until = request.retained_until.saturating_sub(cut) + 1;
     on_event(AgentEvent::AutoCompactionEnd { error: None });
     Ok(())
 }
@@ -458,8 +642,12 @@ fn over_budget(messages: &[Message], limit: u32) -> bool {
 }
 
 fn estimate_tokens(messages: &[Message]) -> u32 {
-    let chars: usize = messages.iter().map(Message::chars).sum();
-    (chars / 4) as u32
+    // CJK characters commonly cost one or more tokens; chars/4 severely undercounts Chinese.
+    let bytes: usize = messages
+        .iter()
+        .map(|message| serde_json::to_vec(message).map(|v| v.len()).unwrap_or(0))
+        .sum();
+    u32::try_from(bytes.div_ceil(3)).unwrap_or(u32::MAX)
 }
 
 /// 只在用户消息的边界切开，避免把工具调用和它的结果拆开。
@@ -482,9 +670,10 @@ fn compaction_cut(messages: &[Message], keep: usize) -> usize {
 struct AssistantDraft {
     text: String,
     thinking: String,
-    calls: Vec<ToolAccum>,
+    calls: std::collections::BTreeMap<usize, ToolAccum>,
     usage: Usage,
     stop: crate::model::StopReason,
+    metadata: Option<crate::model::ProviderMetadata>,
 }
 
 struct ToolAccum {
@@ -501,17 +690,11 @@ impl AssistantDraft {
         name: Option<String>,
         arguments: String,
     ) {
-        if index > 16 {
-            return;
-        }
-        if self.calls.len() <= index {
-            self.calls.resize_with(index + 1, || ToolAccum {
-                id: String::new(),
-                name: String::new(),
-                arguments: String::new(),
-            });
-        }
-        let slot = &mut self.calls[index];
+        let slot = self.calls.entry(index).or_insert_with(|| ToolAccum {
+            id: String::new(),
+            name: String::new(),
+            arguments: String::new(),
+        });
         if let Some(id) = id {
             if !id.is_empty() {
                 slot.id = id;
@@ -527,7 +710,6 @@ impl AssistantDraft {
         let tool_calls = self
             .calls
             .iter()
-            .enumerate()
             .filter(|(_, call)| !call.name.is_empty())
             .map(|(index, call)| ToolCall {
                 id: if call.id.is_empty() {
@@ -544,6 +726,7 @@ impl AssistantDraft {
             text: self.text.clone(),
             thinking: self.thinking.clone(),
             tool_calls,
+            provider_metadata: self.metadata.clone(),
         }
     }
 }
@@ -848,7 +1031,11 @@ mod tests {
         };
         assert!(error.is_none());
         assert!(messages.len() <= COMPACT_KEEP + 2);
-        assert!(matches!(messages.first(), Some(Message::User { .. })));
+        assert!(matches!(
+            messages.first(),
+            Some(Message::ContextSummary { .. })
+        ));
+        assert!(matches!(messages.get(1), Some(Message::User { .. })));
         assert!(events
             .iter()
             .any(|event| matches!(event, AgentEvent::AutoCompactionStart { .. })));

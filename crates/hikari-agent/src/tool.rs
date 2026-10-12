@@ -1,7 +1,10 @@
 use std::fs;
 use std::io::Read;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,12 +14,28 @@ use serde_json::{json, Value};
 use crate::provider::ToolDef;
 
 const OUTPUT_CAP: usize = 16_000;
+#[path = "file_tools.rs"]
+mod file_tools;
+use file_tools::FileTool;
 
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn parameters(&self) -> Value;
     fn call(&self, arguments: &str) -> std::result::Result<String, String>;
+    fn output_limit(&self) -> usize {
+        OUTPUT_CAP
+    }
+    fn call_with_abort(
+        &self,
+        arguments: &str,
+        abort: &AtomicBool,
+    ) -> std::result::Result<String, String> {
+        if abort.load(Ordering::Relaxed) {
+            return Err("已取消工具调用".into());
+        }
+        self.call(arguments)
+    }
 }
 
 pub struct ToolRegistry {
@@ -46,7 +65,28 @@ impl ToolRegistry {
         let root = root.into();
         Self::new(vec![
             Arc::new(ShellTool { root: root.clone() }),
-            Arc::new(ReadTool { root }),
+            Arc::new(ReadTool { root: root.clone() }),
+            Arc::new(FileTool {
+                root: root.clone(),
+                kind: "read",
+            }),
+            Arc::new(FileTool {
+                root: root.clone(),
+                kind: "write",
+            }),
+            Arc::new(FileTool {
+                root: root.clone(),
+                kind: "edit",
+            }),
+            Arc::new(FileTool {
+                root: root.clone(),
+                kind: "ls",
+            }),
+            Arc::new(FileTool {
+                root: root.clone(),
+                kind: "find",
+            }),
+            Arc::new(FileTool { root, kind: "grep" }),
         ])
     }
 
@@ -54,12 +94,41 @@ impl ToolRegistry {
         &self.defs
     }
 
+    pub fn register(&mut self, tool: Arc<dyn Tool>) -> std::result::Result<(), String> {
+        if self.tools.iter().any(|t| t.name() == tool.name()) {
+            return Err(format!("重复工具名：{}", tool.name()));
+        }
+        self.defs.push(ToolDef {
+            name: tool.name().into(),
+            description: tool.description().into(),
+            parameters: tool.parameters(),
+        });
+        self.tools.push(tool);
+        Ok(())
+    }
+
+    pub fn call_with_abort(
+        &self,
+        name: &str,
+        arguments: &str,
+        abort: &AtomicBool,
+    ) -> std::result::Result<String, String> {
+        let tool = self
+            .tools
+            .iter()
+            .find(|t| t.name() == name)
+            .ok_or_else(|| format!("没有名为 {name} 的工具"))?;
+        tool.call_with_abort(arguments, abort)
+            .map(|s| cap_chars(&s, tool.output_limit()))
+            .map_err(|s| cap_chars(&s, OUTPUT_CAP))
+    }
+
     pub fn call(&self, name: &str, arguments: &str) -> std::result::Result<String, String> {
         let Some(tool) = self.tools.iter().find(|tool| tool.name() == name) else {
             return Err(format!("没有名为 {name} 的工具"));
         };
         match tool.call(arguments) {
-            Ok(text) => Ok(cap_chars(&text, OUTPUT_CAP)),
+            Ok(text) => Ok(cap_chars(&text, tool.output_limit())),
             Err(err) => Err(cap_chars(&err, OUTPUT_CAP)),
         }
     }
@@ -91,7 +160,14 @@ impl Tool for ShellTool {
 
     fn call(&self, arguments: &str) -> std::result::Result<String, String> {
         let command = required_string(arguments, "command")?;
-        run_command(&self.root, &command)
+        run_command(&self.root, &command, &AtomicBool::new(false))
+    }
+    fn call_with_abort(
+        &self,
+        arguments: &str,
+        abort: &AtomicBool,
+    ) -> std::result::Result<String, String> {
+        run_command(&self.root, &required_string(arguments, "command")?, abort)
     }
 }
 
@@ -137,7 +213,11 @@ fn required_string(arguments: &str, key: &str) -> std::result::Result<String, St
         .ok_or_else(|| format!("缺少 {key}"))
 }
 
-fn run_command(root: &Path, command: &str) -> std::result::Result<String, String> {
+fn run_command(
+    root: &Path,
+    command: &str,
+    abort: &AtomicBool,
+) -> std::result::Result<String, String> {
     if command.len() > 8_000 {
         return Err("命令太长".into());
     }
@@ -159,12 +239,26 @@ fn run_command(root: &Path, command: &str) -> std::result::Result<String, String
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() > Duration::from_secs(30) => {
+            Ok(None)
+                if abort.load(Ordering::Relaxed) || started.elapsed() > Duration::from_secs(30) =>
+            {
+                #[cfg(windows)]
+                {
+                    let _ = Command::new("taskkill")
+                        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                        .creation_flags(0x08000000)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = out_handle.join();
-                let _ = err_handle.join();
-                return Err("命令超过 30 秒，停掉了".into());
+                return Err(if abort.load(Ordering::Relaxed) {
+                    "命令已取消"
+                } else {
+                    "命令超过 30 秒，停掉了"
+                }
+                .into());
             }
             Ok(None) => thread::sleep(Duration::from_millis(40)),
             Err(err) => return Err(format!("命令中断了。{err}")),
@@ -263,12 +357,20 @@ fn resolve_inside(root: &Path, user_path: &str) -> std::result::Result<PathBuf, 
             .canonicalize()
             .map_err(|err| format!("路径打不开。{err}"))?
     } else {
-        let parent = joined.parent().unwrap_or(Path::new("."));
-        let name = joined.file_name().ok_or("路径不完整")?;
-        let parent = parent
-            .canonicalize()
-            .map_err(|_| "路径不存在".to_string())?;
-        parent.join(name)
+        let mut ancestor = joined.as_path();
+        let mut tail = Vec::new();
+        while !ancestor.exists() {
+            tail.push(ancestor.file_name().ok_or("路径不完整")?.to_os_string());
+            ancestor = ancestor.parent().ok_or("路径不存在")?;
+        }
+        let mut full = ancestor.canonicalize().map_err(|e| e.to_string())?;
+        for part in tail.into_iter().rev() {
+            if part == ".." || part == "." {
+                return Err("路径不能包含未解析的父目录".into());
+            }
+            full.push(part);
+        }
+        full
     };
     if !full.starts_with(&root) {
         return Err("路径超出工作区".into());

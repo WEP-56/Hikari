@@ -13,12 +13,17 @@ pub enum Message {
         thinking: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ToolCall>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_metadata: Option<ProviderMetadata>,
     },
     ToolResult {
         tool_call_id: String,
         name: String,
         text: String,
         is_error: bool,
+    },
+    ContextSummary {
+        text: String,
     },
 }
 
@@ -32,6 +37,7 @@ impl Message {
             text: text.into(),
             thinking: String::new(),
             tool_calls: Vec::new(),
+            provider_metadata: None,
         }
     }
 
@@ -54,6 +60,7 @@ impl Message {
             Self::User { text } | Self::Assistant { text, .. } | Self::ToolResult { text, .. } => {
                 text
             }
+            Self::ContextSummary { text } => text,
         }
     }
 
@@ -64,6 +71,7 @@ impl Message {
                 text,
                 thinking,
                 tool_calls,
+                ..
             } => {
                 text.chars().count()
                     + thinking.chars().count()
@@ -73,8 +81,16 @@ impl Message {
                         .sum::<usize>()
             }
             Self::ToolResult { text, name, .. } => text.chars().count() + name.chars().count(),
+            Self::ContextSummary { text } => text.chars().count(),
         }
     }
+}
+
+/// Protocol-native content (including signed reasoning) must survive tool rounds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderMetadata {
+    pub protocol: String,
+    pub items: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -94,6 +110,7 @@ pub enum StopReason {
     ToolUse,
     Error,
     Aborted,
+    PauseTurn,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

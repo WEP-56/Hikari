@@ -8,18 +8,23 @@ pub mod error;
 pub mod memory;
 pub mod model;
 pub mod openai;
+pub mod pi;
+pub mod protocols;
 pub mod provider;
 pub mod tool;
+pub mod transport;
 
 pub use agent::{
-    companion_prompt, run_turn, AgentEvent, TurnHost, TurnRequest, DEFAULT_CONTEXT_TOKENS,
+    companion_prompt, run_turn, run_turn_with_control, AgentEvent, TurnControl, TurnHost,
+    TurnRequest, DEFAULT_CONTEXT_TOKENS,
 };
 pub use error::{AgentError, Result};
 pub use memory::{
     ConsolidateReceipt, ConsolidateState, Memory, NullMemory, RecallItem, RetainReceipt,
     RetainState,
 };
-pub use model::{Message, StopReason, ToolCall, Usage};
+pub use model::{Message, ProviderMetadata, StopReason, ToolCall, Usage};
 pub use openai::OpenAiProvider;
+pub use protocols::{ApiProtocol, ProtocolProvider, ProviderConfig};
 pub use provider::{Context, Provider, StreamEvent, ToolDef};
 pub use tool::ToolRegistry;

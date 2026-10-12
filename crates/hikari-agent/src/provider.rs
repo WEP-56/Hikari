@@ -33,6 +33,7 @@ pub enum StreamEvent {
         output: u64,
     },
     Done(StopReason),
+    Metadata(crate::model::ProviderMetadata),
 }
 
 /// 只负责把上下文变成流。

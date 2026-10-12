@@ -1,5 +1,5 @@
 [package]
-name = "hikari-preview"
+name = "hikari"
 version = "0.1.0"
 edition = "2021"
 publish = false
@@ -7,19 +7,11 @@ publish = false
 [dependencies]
 gpui-kit = "0.7.3"
 hikari-agent = { path = "../crates/hikari-agent" }
+hikari-runtime = { path = "../crates/hikari-runtime" }
+serde_json = "1"
 portable-pty = "0.8"
 
 [build-dependencies]
 ico = "0.4"
 image = "0.25"
 winresource = "0.1"
-
-[profile.dev.package]
-gpui-pre = { opt-level = 3 }
-gpui-component = { opt-level = 3 }
-gpui-kit = { opt-level = 3 }
-gpui-kit-assets = { opt-level = 3 }
-gpui-pre-macros = { opt-level = 3 }
-gpui-pre-platform = { opt-level = 3 }
-rustybuzz = { opt-level = 3 }
-taffy = { opt-level = 3 }

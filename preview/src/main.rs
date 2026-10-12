@@ -12,9 +12,13 @@ use gpui_kit::component::{
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::*;
 use hikari_agent::{
-    companion_prompt, run_turn, AgentEvent, ConsolidateState, Message as AgentMessage, NullMemory,
-    OpenAiProvider, RetainState, ToolRegistry, TurnHost, TurnRequest, Usage,
-    DEFAULT_CONTEXT_TOKENS,
+    companion_prompt, run_turn_with_control, AgentEvent, ApiProtocol, ConsolidateState,
+    Message as AgentMessage, NullMemory, ProtocolProvider, RetainState, ToolRegistry, TurnControl,
+    TurnHost, TurnRequest, Usage, DEFAULT_CONTEXT_TOKENS,
+};
+use hikari_runtime::{
+    AppConfig, ConfigStore, McpManager, McpServerConfig, McpStatus, McpTransport, Session,
+    SessionStore, SkillCatalog,
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -94,12 +98,18 @@ struct Talk {
     lines: Vec<Line>,
     messages: Vec<AgentMessage>,
     retained_until: usize,
+    transcript: Vec<AgentMessage>,
+    usage: Usage,
 }
 
 struct Incoming {
     talk_id: u64,
     gen: u64,
     event: AgentEvent,
+}
+
+struct RuntimeUpdate {
+    statuses: Vec<McpStatus>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -154,6 +164,8 @@ struct Preview {
     next_talk_id: u64,
     turn_gen: u64,
     busy: bool,
+    turn_control: Arc<TurnControl>,
+    running_talk: Option<u64>,
     abort: Option<Arc<AtomicBool>>,
     event_tx: Sender<Incoming>,
     event_rx: Receiver<Incoming>,
@@ -164,7 +176,6 @@ struct Preview {
     section: Section,
     dark: bool,
     memory_on: bool,
-    skill_notes: bool,
     terminal_open: bool,
     terminal_text: String,
     terminal_error: Option<String>,
@@ -176,12 +187,40 @@ struct Preview {
     provider: Entity<InputState>,
     model: Entity<InputState>,
     key: Entity<InputState>,
+    key_env: Entity<InputState>,
     call_name: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
+    config: AppConfig,
+    config_store: ConfigStore,
+    session_store: SessionStore,
+    skills: SkillCatalog,
+    skill_path: Entity<InputState>,
+    mcp_config: Entity<TextareaState>,
+    mcp: Arc<McpManager>,
+    mcp_statuses: Vec<McpStatus>,
+    runtime_tx: Sender<RuntimeUpdate>,
+    runtime_rx: Receiver<RuntimeUpdate>,
+    management_notice: String,
+    mcp_name: Entity<InputState>,
+    mcp_target: Entity<InputState>,
+    mcp_args: Entity<InputState>,
+    mcp_http: bool,
 }
 
 impl Preview {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let config_store = ConfigStore::new(workspace_dir().join(".hikari"));
+        let session_store = SessionStore::new(workspace_dir().join(".hikari"));
+        let mut management_notice = String::new();
+        let config = config_store.load().unwrap_or_else(|e| {
+            management_notice = e.message;
+            AppConfig::default()
+        });
+        let skills = SkillCatalog::discover(
+            &workspace_dir(),
+            &config.skill_roots,
+            &config.disabled_skills,
+        );
         let draft = cx.new(|cx| {
             let mut state = TextareaState::new(window, cx)
                 .placeholder("想说的话，放在这里")
@@ -190,11 +229,34 @@ impl Preview {
             state
         });
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("找一段过去的对话"));
-        let provider =
-            cx.new(|cx| InputState::new(window, cx).default_value("https://api.openai.com/v1"));
-        let model = cx.new(|cx| InputState::new(window, cx).default_value("gpt-4.1"));
-        let key = cx.new(|cx| InputState::new(window, cx).placeholder("密钥留在本机"));
-        let call_name = cx.new(|cx| InputState::new(window, cx).default_value("光"));
+        let provider = cx
+            .new(|cx| InputState::new(window, cx).default_value(config.provider.base_url.clone()));
+        let model =
+            cx.new(|cx| InputState::new(window, cx).default_value(config.provider.model.clone()));
+        let key = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("本次运行使用的密钥")
+                .masked(true)
+        });
+        let key_env = cx.new(|cx| {
+            InputState::new(window, cx).default_value(config.provider.api_key_env.clone())
+        });
+        let call_name =
+            cx.new(|cx| InputState::new(window, cx).default_value(config.persona_name.clone()));
+        let skill_path = cx
+            .new(|cx| InputState::new(window, cx).placeholder("Skill 目录或包含多个 Skill 的目录"));
+        let mcp_config = cx.new(|cx| {
+            let mut state = TextareaState::new(window, cx);
+            state.set_value(
+                serde_json::to_string_pretty(&config.mcp_servers).unwrap_or_default(),
+                window,
+                cx,
+            );
+            state
+        });
+        let mcp_name = cx.new(|cx| InputState::new(window, cx).placeholder("服务名称"));
+        let mcp_target = cx.new(|cx| InputState::new(window, cx).placeholder("启动命令或服务 URL"));
+        let mcp_args = cx.new(|cx| InputState::new(window, cx).default_value("[]"));
 
         let search_sub = cx.subscribe_in(&search, window, |_, _, event, _, cx| {
             if matches!(event, InputEvent::Change) {
@@ -208,10 +270,23 @@ impl Preview {
         });
 
         let (event_tx, event_rx) = mpsc::channel();
-        let mut talks = sample_talks();
-        for talk in &mut talks {
-            talk.messages = messages_from_lines(&talk.lines);
-        }
+        let sessions = session_store.load().unwrap_or_else(|e| {
+            management_notice = e.message;
+            Vec::new()
+        });
+        let next_talk_id = sessions.iter().map(|s| s.id).max().unwrap_or(0) + 1;
+        let talks = sessions.into_iter().map(talk_from_session).collect();
+        let (runtime_tx, runtime_rx) = mpsc::channel();
+        let mcp = Arc::new(McpManager::default());
+        Theme::change(
+            if config.dark {
+                ThemeMode::Dark
+            } else {
+                ThemeMode::Light
+            },
+            Some(window),
+            cx,
+        );
 
         Self {
             talks,
@@ -222,9 +297,11 @@ impl Preview {
             resize_origin: 0.,
             resize_start: 292.,
             thinking: 3,
-            next_talk_id: 4,
+            next_talk_id,
             turn_gen: 0,
             busy: false,
+            turn_control: Arc::new(TurnControl::default()),
+            running_talk: None,
             abort: None,
             event_tx,
             event_rx,
@@ -233,9 +310,8 @@ impl Preview {
             searching: false,
             settings: false,
             section: Section::Provider,
-            dark: true,
-            memory_on: true,
-            skill_notes: false,
+            dark: config.dark,
+            memory_on: false,
             terminal_open: false,
             terminal_text: String::new(),
             terminal_error: None,
@@ -247,8 +323,24 @@ impl Preview {
             provider,
             model,
             key,
+            key_env,
             call_name,
             _subscriptions: vec![search_sub, draft_sub],
+            config,
+            config_store,
+            session_store,
+            skills,
+            skill_path,
+            mcp_config,
+            mcp,
+            mcp_statuses: Vec::new(),
+            runtime_tx,
+            runtime_rx,
+            management_notice,
+            mcp_name,
+            mcp_target,
+            mcp_args,
+            mcp_http: false,
         }
     }
 
@@ -268,9 +360,7 @@ impl Preview {
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
-            if let Some(flag) = &self.abort {
-                flag.store(true, Ordering::Relaxed);
-            }
+            self.queue_input(false, window, cx);
             return;
         }
         let text = self.draft.read(cx).value().trim().to_string();
@@ -292,6 +382,8 @@ impl Preview {
                         lines: Vec::new(),
                         messages: Vec::new(),
                         retained_until: 0,
+                        transcript: Vec::new(),
+                        usage: Usage::default(),
                     },
                 );
                 self.active = Some(0);
@@ -306,13 +398,20 @@ impl Preview {
         self.talks[idx].lines.push(Line::user(&text));
         self.talks[idx].lines.push(Line::pending());
         self.talks[idx].messages.push(AgentMessage::user(&text));
+        self.talks[idx].transcript.push(AgentMessage::user(&text));
+        self.save_sessions();
         self.draft.update(cx, |state, cx| {
             state.set_value("", window, cx);
         });
 
-        let base = self.provider.read(cx).value().to_string();
-        let model = self.model.read(cx).value().to_string();
+        self.sync_provider_config(cx);
+        let provider_config = self.config.provider.clone();
         let key = self.key.read(cx).value().to_string();
+        let key = if key.trim().is_empty() {
+            std::env::var(&provider_config.api_key_env).unwrap_or_default()
+        } else {
+            key
+        };
         let name = self.call_name.read(cx).value().to_string();
         let thinking = THINKING[self.thinking];
         let messages = self.talks[idx].messages.clone();
@@ -320,19 +419,7 @@ impl Preview {
         // 记忆核心还没接上。开关先留着，loop 里的 recall / retain 缝已经在。
         let _memory_on = self.memory_on;
 
-        let provider = match OpenAiProvider::new(
-            if base.trim().is_empty() {
-                "https://api.openai.com/v1"
-            } else {
-                base.trim()
-            },
-            if model.trim().is_empty() {
-                "gpt-4.1"
-            } else {
-                model.trim()
-            },
-            key.trim(),
-        ) {
+        let provider = match ProtocolProvider::new(provider_config.clone(), key.trim()) {
             Ok(provider) => provider,
             Err(err) => {
                 self.finish_pending(idx, &err.message);
@@ -346,13 +433,30 @@ impl Preview {
         let abort = Arc::new(AtomicBool::new(false));
         self.abort = Some(abort.clone());
         self.busy = true;
+        self.running_talk = Some(talk_id);
+        self.turn_control = Arc::new(TurnControl::default());
+        let turn_control = self.turn_control.clone();
         self.start_pump(cx);
         let tx = self.event_tx.clone();
         let cwd = workspace_dir();
+        let skills = self.skills.clone();
+        let mcp = self.mcp.clone();
+        let mcp_configs = self.config.mcp_servers.clone();
+        let runtime_tx = self.runtime_tx.clone();
+        let max_tool_rounds = self.config.max_tool_rounds;
         thread::spawn(move || {
+            mcp.reconcile(&mcp_configs, &cwd);
+            let _ = runtime_tx.send(RuntimeUpdate {
+                statuses: mcp.statuses(),
+            });
+            let mut tools = ToolRegistry::workspace(cwd);
+            let setup_error = skills
+                .register(&mut tools)
+                .and_then(|_| mcp.register(&mut tools))
+                .err();
             let host = TurnHost {
                 provider: Arc::new(provider),
-                tools: Arc::new(ToolRegistry::workspace(cwd)),
+                tools: Arc::new(tools),
                 memory: Arc::new(NullMemory),
                 abort,
             };
@@ -361,9 +465,9 @@ impl Preview {
                 messages,
                 retained_until,
                 query: text.clone(),
-                system_prompt: companion_prompt(&name, thinking),
-                context_limit_tokens: DEFAULT_CONTEXT_TOKENS,
-                max_tool_rounds: 8,
+                system_prompt: format!("{}{}", companion_prompt(&name, thinking), skills.prompt()),
+                context_limit_tokens: provider_config.context_tokens,
+                max_tool_rounds,
             };
             let emit = |event| {
                 let _ = tx.send(Incoming {
@@ -372,7 +476,20 @@ impl Preview {
                     event,
                 });
             };
-            if catch_unwind(AssertUnwindSafe(|| run_turn(&host, request, emit))).is_err() {
+            if let Some(error) = setup_error {
+                emit(AgentEvent::AgentEnd {
+                    messages: request.messages,
+                    error: Some(error),
+                    usage: Usage::default(),
+                    retained_until,
+                });
+                return;
+            }
+            if catch_unwind(AssertUnwindSafe(|| {
+                run_turn_with_control(&host, request, &turn_control, emit)
+            }))
+            .is_err()
+            {
                 let _ = tx.send(Incoming {
                     talk_id,
                     gen,
@@ -380,6 +497,7 @@ impl Preview {
                         messages: Vec::new(),
                         error: Some("内部出错了。".into()),
                         usage: Usage::default(),
+                        retained_until,
                     },
                 });
             }
@@ -402,6 +520,10 @@ impl Preview {
     }
 
     fn drain_events(&mut self, cx: &mut Context<Self>) {
+        while let Ok(update) = self.runtime_rx.try_recv() {
+            self.mcp_statuses = update.statuses;
+            cx.notify();
+        }
         loop {
             match self.event_rx.try_recv() {
                 Ok(incoming) => self.apply_event(incoming, cx),
@@ -420,6 +542,10 @@ impl Preview {
             return;
         };
         match event {
+            AgentEvent::InputDelivered { text } => {
+                self.talks[idx].lines.push(Line::user(text.clone()));
+                self.talks[idx].transcript.push(AgentMessage::user(text));
+            }
             AgentEvent::MessageStart { .. } => self.ensure_live(idx),
             AgentEvent::MessageUpdate { text, thinking } => {
                 self.ensure_live(idx);
@@ -441,6 +567,7 @@ impl Preview {
                 }
             }
             AgentEvent::MessageEnd { message } => {
+                self.talks[idx].transcript.push(message.clone());
                 if let Some(pos) = self.talks[idx].lines.iter().rposition(Line::is_live) {
                     let empty = message.text().is_empty();
                     if empty {
@@ -473,10 +600,16 @@ impl Preview {
             }
             AgentEvent::ToolExecutionEnd {
                 tool_call_id,
+                tool_name,
                 text,
                 is_error,
-                ..
             } => {
+                self.talks[idx].transcript.push(AgentMessage::tool_result(
+                    &tool_call_id,
+                    &tool_name,
+                    &text,
+                    is_error,
+                ));
                 if let Some(line) = self.talks[idx].lines.iter_mut().rev().find(
                     |line| matches!(&line.body, LineBody::Tool { id, .. } if id == &tool_call_id),
                 ) {
@@ -536,16 +669,31 @@ impl Preview {
                 messages,
                 error,
                 usage,
+                retained_until,
             } => {
                 if !messages.is_empty() {
                     self.talks[idx].messages = messages;
                 }
                 self.usage = usage;
+                self.talks[idx].usage = usage;
+                self.talks[idx].retained_until = retained_until;
                 self.finish_pending(idx, error.as_deref().unwrap_or(""));
                 if gen == self.turn_gen {
                     self.busy = false;
+                    self.running_talk = None;
                     self.abort = None;
+                    let pending = self.turn_control.drain_pending();
+                    if !pending.is_empty() {
+                        self.management_notice =
+                            format!("{} 条排队输入未执行，已保留在会话旁注", pending.len());
+                        // No window is available in the event pump; preserve the text as a note.
+                        self.talks[idx].lines.push(Line::note(format!(
+                            "尚未执行的输入：{}",
+                            pending.join("\n")
+                        )));
+                    }
                 }
+                self.save_sessions();
             }
         }
         cx.notify();
@@ -610,57 +758,55 @@ impl Preview {
     }
 }
 
-fn sample_talks() -> Vec<Talk> {
-    vec![
-        Talk {
-            id: 1,
-            title: "生命周期".into(),
-            preview: "借用结束以后，原来的值还在。".into(),
-            when: "昨天".into(),
-            lines: vec![
-                Line::user("生命周期其实可以这样理解吗？"),
-                Line::assistant("可以。它只是在说：这份值，现在归谁，能用多久。"),
-            ],
-            messages: Vec::new(),
-            retained_until: 0,
-        },
-        Talk {
-            id: 2,
-            title: "周末的小工具".into(),
-            preview: "不急，下周再一起看。".into(),
-            when: "周日".into(),
-            lines: vec![
-                Line::user("要不要一起把那个小工具写完？"),
-                Line::assistant("可以。今天先放着也没关系。"),
-            ],
-            messages: Vec::new(),
-            retained_until: 0,
-        },
-        Talk {
-            id: 3,
-            title: "周五晚饭".into(),
-            preview: "已经记在日历上了。".into(),
-            when: "周二".into(),
-            lines: vec![Line::assistant("周五 19:00 的晚饭，我帮你留着。")],
-            messages: Vec::new(),
-            retained_until: 0,
-        },
-    ]
-}
-
-fn messages_from_lines(lines: &[Line]) -> Vec<AgentMessage> {
-    lines
+fn talk_from_session(session: Session) -> Talk {
+    let lines = session
+        .transcript
         .iter()
-        .filter_map(|line| match &line.body {
-            LineBody::User(text) => Some(AgentMessage::user(text.to_string())),
-            LineBody::Assistant { text, .. } if !text.is_empty() => {
-                Some(AgentMessage::assistant(text.to_string()))
-            }
-            _ => None,
+        .filter_map(|message| match message {
+            AgentMessage::User { text } => Some(Line::user(text.clone())),
+            AgentMessage::Assistant { text, thinking, .. } => Some(Line {
+                body: LineBody::Assistant {
+                    text: text.clone().into(),
+                    thinking: thinking.clone().into(),
+                    live: false,
+                },
+            }),
+            AgentMessage::ToolResult {
+                tool_call_id,
+                name,
+                text,
+                is_error,
+            } => Some(Line {
+                body: LineBody::Tool {
+                    id: tool_call_id.clone(),
+                    name: name.clone().into(),
+                    detail: text.clone().into(),
+                    running: false,
+                    error: *is_error,
+                },
+            }),
+            AgentMessage::ContextSummary { .. } => None,
         })
-        .collect()
+        .collect();
+    let preview = session
+        .transcript
+        .iter()
+        .rev()
+        .find(|m| !m.text().is_empty())
+        .map(|m| m.text().chars().take(60).collect::<String>())
+        .unwrap_or_default();
+    Talk {
+        id: session.id,
+        title: session.title.into(),
+        preview: preview.into(),
+        when: "已保存".into(),
+        lines,
+        messages: session.context,
+        transcript: session.transcript,
+        retained_until: session.retained_until,
+        usage: session.usage,
+    }
 }
-
 fn title_from(text: &str) -> SharedString {
     let trimmed: String = text.chars().take(18).collect();
     if text.chars().count() > 18 {
@@ -1206,6 +1352,29 @@ impl Preview {
                                 .items_center()
                                 .gap_1()
                                 .child(self.context_usage(ink))
+                                .when(self.busy, |this| {
+                                    this.child(
+                                        Button::new("queue-steering")
+                                            .ghost()
+                                            .small()
+                                            .label("插入当前任务")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.queue_input(true, window, cx)
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("queue-follow-up")
+                                            .ghost()
+                                            .small()
+                                            .label(format!(
+                                                "排队 · {}",
+                                                self.turn_control.pending()
+                                            ))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.queue_input(false, window, cx)
+                                            })),
+                                    )
+                                })
                                 .child(
                                     div()
                                         .id("send")
@@ -1226,7 +1395,13 @@ impl Preview {
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _, window, cx| {
-                                                this.send(window, cx)
+                                                if this.busy {
+                                                    if let Some(abort) = &this.abort {
+                                                        abort.store(true, Ordering::Relaxed);
+                                                    }
+                                                } else {
+                                                    this.send(window, cx);
+                                                }
                                             }),
                                         ),
                                 ),
@@ -1621,6 +1796,200 @@ fn side_row(
 }
 
 impl Preview {
+    fn sync_provider_config(&mut self, cx: &mut Context<Self>) {
+        self.config.provider.base_url = self.provider.read(cx).value().trim().to_string();
+        self.config.provider.model = self.model.read(cx).value().trim().to_string();
+        self.config.provider.api_key_env = self.key_env.read(cx).value().trim().to_string();
+        self.config.persona_name = self.call_name.read(cx).value().to_string();
+        self.config.dark = self.dark;
+    }
+
+    fn queue_input(&mut self, steering: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.draft.read(cx).value().trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        if self.active.map(|i| self.talks[i].id) != self.running_talk {
+            self.management_notice = "请回到正在进行的会话，或等它完成后再发送".into();
+            cx.notify();
+            return;
+        }
+        if steering {
+            self.turn_control.steer(text);
+        } else {
+            self.turn_control.follow_up(text);
+        }
+        self.draft
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        cx.notify();
+    }
+    fn save_config(&mut self, cx: &mut Context<Self>) {
+        self.sync_provider_config(cx);
+        self.management_notice = match self.config_store.save(&self.config) {
+            Ok(()) => "设置已保存。输入的密钥仅用于本次运行；重启后从环境变量读取。".into(),
+            Err(e) => e.message,
+        };
+        cx.notify();
+    }
+    fn save_sessions(&mut self) {
+        let sessions: Vec<_> = self
+            .talks
+            .iter()
+            .map(|talk| Session {
+                id: talk.id,
+                title: talk.title.to_string(),
+                transcript: talk.transcript.clone(),
+                context: talk.messages.clone(),
+                retained_until: talk.retained_until,
+                usage: talk.usage,
+            })
+            .collect();
+        if let Err(e) = self.session_store.save(&sessions) {
+            self.management_notice = e.message;
+        }
+    }
+    fn refresh_skills(&mut self, cx: &mut Context<Self>) {
+        self.skills = SkillCatalog::discover(
+            &workspace_dir(),
+            &self.config.skill_roots,
+            &self.config.disabled_skills,
+        );
+        self.management_notice = if self.skills.diagnostics.is_empty() {
+            format!("发现 {} 个 Skill", self.skills.skills.len())
+        } else {
+            self.skills.diagnostics.join("\n")
+        };
+        cx.notify();
+    }
+    fn add_skill_root(&mut self, cx: &mut Context<Self>) {
+        let value = self.skill_path.read(cx).value().trim().to_string();
+        if value.is_empty() {
+            self.management_notice = "请填写 Skill 目录".into();
+            cx.notify();
+            return;
+        }
+        let path = PathBuf::from(value);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            workspace_dir().join(path)
+        };
+        match path.canonicalize() {
+            Ok(path) => {
+                if !self.config.skill_roots.contains(&path) {
+                    self.config.skill_roots.push(path);
+                }
+                self.save_config(cx);
+                self.refresh_skills(cx);
+            }
+            Err(e) => {
+                self.management_notice = format!("目录无法打开：{e}");
+                cx.notify();
+            }
+        }
+    }
+    fn toggle_skill(&mut self, path: PathBuf, enabled: bool, cx: &mut Context<Self>) {
+        self.config.disabled_skills.retain(|p| p != &path);
+        if !enabled {
+            self.config.disabled_skills.push(path);
+        }
+        self.save_config(cx);
+        self.refresh_skills(cx);
+    }
+    fn sync_mcp_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let value = serde_json::to_string_pretty(&self.config.mcp_servers).unwrap_or_default();
+        self.mcp_config
+            .update(cx, |state, cx| state.set_value(value, window, cx));
+    }
+    fn reconnect_mcp(&mut self, cx: &mut Context<Self>) {
+        let mcp = self.mcp.clone();
+        let configs = self.config.mcp_servers.clone();
+        let tx = self.runtime_tx.clone();
+        self.start_pump(cx);
+        self.management_notice = "正在连接 MCP 服务".into();
+        thread::spawn(move || {
+            mcp.reconcile(&configs, &workspace_dir());
+            let _ = tx.send(RuntimeUpdate {
+                statuses: mcp.statuses(),
+            });
+        });
+        cx.notify();
+    }
+    fn apply_mcp_config(&mut self, cx: &mut Context<Self>) {
+        let parsed =
+            serde_json::from_str::<Vec<McpServerConfig>>(&self.mcp_config.read(cx).value());
+        let result = parsed.map_err(|e| e.to_string()).and_then(|servers| {
+            let mut names = std::collections::HashSet::new();
+            for server in &servers {
+                server.validate().map_err(|e| e.message)?;
+                if !names.insert(server.name.clone()) {
+                    return Err("MCP 名称不能重复".into());
+                }
+            }
+            Ok(servers)
+        });
+        match result {
+            Ok(servers) => {
+                self.config.mcp_servers = servers;
+                self.save_config(cx);
+                self.reconnect_mcp(cx);
+            }
+            Err(error) => {
+                self.management_notice = error;
+                cx.notify();
+            }
+        }
+    }
+    fn add_mcp(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.mcp_name.read(cx).value().trim().to_string();
+        let target = self.mcp_target.read(cx).value().trim().to_string();
+        let transport = if self.mcp_http {
+            McpTransport::StreamableHttp {
+                url: target,
+                bearer_token_env: None,
+            }
+        } else {
+            let args = match serde_json::from_str::<Vec<String>>(&self.mcp_args.read(cx).value()) {
+                Ok(args) => args,
+                Err(e) => {
+                    self.management_notice = format!("参数需要字符串数组：{e}");
+                    cx.notify();
+                    return;
+                }
+            };
+            McpTransport::Stdio {
+                command: target,
+                args,
+                env: Default::default(),
+            }
+        };
+        let config = McpServerConfig {
+            name,
+            enabled: true,
+            transport,
+            timeout_seconds: 30,
+        };
+        if let Err(e) = config.validate() {
+            self.management_notice = e.message;
+            cx.notify();
+            return;
+        }
+        if self
+            .config
+            .mcp_servers
+            .iter()
+            .any(|s| s.name == config.name)
+        {
+            self.management_notice = "这个 MCP 名称已存在".into();
+            cx.notify();
+            return;
+        }
+        self.config.mcp_servers.push(config);
+        self.sync_mcp_editor(window, cx);
+        self.save_config(cx);
+        self.reconnect_mcp(cx);
+    }
+
     fn settings_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .size_full()
@@ -1672,11 +2041,7 @@ impl Preview {
             Section::Memory => div().child(self.memory_page(cx)),
             Section::Persona => div().child(self.persona_page(cx)),
             Section::Skill => div().child(self.skill_page(cx)),
-            Section::Mcp => div().child(note(
-                "MCP",
-                "还没有连接。想用的时候再加，现在不用准备。",
-                theme.clone(),
-            )),
+            Section::Mcp => div().child(self.mcp_page(cx)),
             Section::Channels => div().child(note(
                 "外部通讯",
                 "Telegram、Discord 以后可以接进来。今天先只在这里说话。",
@@ -1696,7 +2061,22 @@ impl Preview {
             .overflow_y_scroll()
             .px(px(48.))
             .py(px(36.))
-            .child(div().max_w(px(560.)).flex().flex_col().gap_5().child(body))
+            .child(
+                div()
+                    .max_w(px(560.))
+                    .flex()
+                    .flex_col()
+                    .gap_5()
+                    .child(body)
+                    .child(
+                        Button::new("save-settings")
+                            .label("保存设置")
+                            .on_click(cx.listener(|this, _, _, cx| this.save_config(cx))),
+                    )
+                    .when(!self.management_notice.is_empty(), |this| {
+                        this.child(div().text_xs().child(self.management_notice.clone()))
+                    }),
+            )
     }
 
     fn provider_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1704,9 +2084,54 @@ impl Preview {
         v_flex()
             .gap_5()
             .child(page_title("提供商", "连上一个模型就够了。", theme.clone()))
+            .child(
+                v_flex().gap_2().children(
+                    [
+                        ApiProtocol::ChatCompletions,
+                        ApiProtocol::Responses,
+                        ApiProtocol::Anthropic,
+                    ]
+                    .into_iter()
+                    .map(|protocol| {
+                        Button::new(SharedString::from(format!("protocol-{protocol:?}")))
+                            .label(protocol.label())
+                            .when(self.config.provider.protocol == protocol, |this| {
+                                this.primary()
+                            })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.config.provider.protocol = protocol;
+                                let (base, model, key_env) = if protocol == ApiProtocol::Anthropic {
+                                    (
+                                        "https://api.anthropic.com/v1",
+                                        "claude-sonnet-4-6",
+                                        "ANTHROPIC_API_KEY",
+                                    )
+                                } else {
+                                    ("https://api.openai.com/v1", "gpt-4.1", "OPENAI_API_KEY")
+                                };
+                                this.provider
+                                    .update(cx, |state, cx| state.set_value(base, window, cx));
+                                this.model
+                                    .update(cx, |state, cx| state.set_value(model, window, cx));
+                                this.key_env
+                                    .update(cx, |state, cx| state.set_value(key_env, window, cx));
+                                cx.notify();
+                            }))
+                    }),
+                ),
+            )
             .child(field("地址", Input::new(&self.provider), theme.clone()))
             .child(field("模型", Input::new(&self.model), theme.clone()))
-            .child(field("密钥", Input::new(&self.key), theme))
+            .child(field(
+                "密钥（本次运行）",
+                Input::new(&self.key),
+                theme.clone(),
+            ))
+            .child(field(
+                "密钥环境变量（重启后使用）",
+                Input::new(&self.key_env),
+                theme,
+            ))
     }
 
     fn appearance_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1785,17 +2210,257 @@ impl Preview {
             .gap_4()
             .child(page_title(
                 "Skill",
-                "会的事情可以很少。少一点，更轻松。",
-                theme,
+                "添加本机的 Skill，让 Hikari 在需要时读取它的指令。",
+                theme.clone(),
+            ))
+            .child(Input::new(&self.skill_path))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("add-skill-root")
+                            .label("添加目录")
+                            .on_click(cx.listener(|this, _, _, cx| this.add_skill_root(cx))),
+                    )
+                    .child(
+                        Button::new("refresh-skills")
+                            .ghost()
+                            .label("重新扫描")
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh_skills(cx))),
+                    ),
+            )
+            .children(
+                self.config
+                    .skill_roots
+                    .iter()
+                    .enumerate()
+                    .map(|(index, path)| {
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_xs().child(path.display().to_string()))
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "remove-skill-root-{index}"
+                                )))
+                                .ghost()
+                                .small()
+                                .label("移除目录")
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.config.skill_roots.remove(index);
+                                        this.save_config(cx);
+                                        this.refresh_skills(cx);
+                                    },
+                                )),
+                            )
+                    }),
+            )
+            .children(self.skills.skills.iter().enumerate().map(|(index, skill)| {
+                let path = skill.path.clone();
+                v_flex()
+                    .gap_1()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(
+                        Switch::new(SharedString::from(format!("skill-{index}")))
+                            .label(skill.name.clone())
+                            .checked(skill.enabled)
+                            .on_change(cx.listener(move |this, value, _, cx| {
+                                this.toggle_skill(path.clone(), *value, cx)
+                            })),
+                    )
+                    .child(div().text_sm().child(skill.description.clone()))
+                    .child(div().text_xs().child(skill.path.display().to_string()))
+            }))
+            .when(self.skills.skills.is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .child("还没有 Skill。目录里需要包含 SKILL.md。"),
+                )
+            })
+    }
+
+    fn mcp_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().colors.clone();
+        v_flex()
+            .gap_4()
+            .child(page_title(
+                "MCP",
+                "连接本机或远程工具服务。连接成功后，Hikari 就可以调用它们。",
+                theme.clone(),
             ))
             .child(
-                Switch::new("skill-notes")
-                    .label("帮我记一句备忘")
-                    .checked(self.skill_notes)
-                    .on_change(cx.listener(|this, value, _, cx| {
-                        this.skill_notes = *value;
-                        cx.notify();
-                    })),
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("mcp-stdio")
+                            .label("本机 stdio")
+                            .when(!self.mcp_http, |this| this.primary())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.mcp_http = false;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("mcp-http")
+                            .label("Streamable HTTP")
+                            .when(self.mcp_http, |this| this.primary())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.mcp_http = true;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(field("服务名称", Input::new(&self.mcp_name), theme.clone()))
+            .child(field(
+                if self.mcp_http {
+                    "服务 URL"
+                } else {
+                    "启动命令"
+                },
+                Input::new(&self.mcp_target),
+                theme.clone(),
+            ))
+            .when(!self.mcp_http, |this| {
+                this.child(field(
+                    "启动参数（字符串数组）",
+                    Input::new(&self.mcp_args),
+                    theme.clone(),
+                ))
+            })
+            .child(
+                Button::new("add-mcp")
+                    .label("添加并连接")
+                    .on_click(cx.listener(|this, _, window, cx| this.add_mcp(window, cx))),
+            )
+            .children(
+                self.config
+                    .mcp_servers
+                    .iter()
+                    .enumerate()
+                    .map(|(index, server)| {
+                        let name = server.name.clone();
+                        let retry_name = name.clone();
+                        let disconnect_name = name.clone();
+                        let status = self.mcp_statuses.iter().find(|s| s.name == name);
+                        let label = match status.map(|s| s.state.as_str()) {
+                            Some("connected") => "已连接",
+                            Some("failed") => "连接失败",
+                            Some("connecting") => "连接中",
+                            _ if !server.enabled => "已停用",
+                            _ => "未连接",
+                        };
+                        let detail = status.and_then(|s| s.error.clone()).unwrap_or_else(|| {
+                            status
+                                .map(|s| {
+                                    format!("{} 个工具\n{}", s.tools.len(), s.tools.join(" · "))
+                                })
+                                .unwrap_or_default()
+                        });
+                        v_flex()
+                            .gap_2()
+                            .p_3()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(theme.border)
+                            .child(
+                                Switch::new(SharedString::from(format!("mcp-enabled-{index}")))
+                                    .label(format!("{name} · {label}"))
+                                    .checked(server.enabled)
+                                    .on_change(cx.listener(move |this, value, window, cx| {
+                                        this.config.mcp_servers[index].enabled = *value;
+                                        this.sync_mcp_editor(window, cx);
+                                        this.save_config(cx);
+                                        this.reconnect_mcp(cx);
+                                    })),
+                            )
+                            .child(div().text_xs().child(detail))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        Button::new(SharedString::from(format!(
+                                            "mcp-retry-{index}"
+                                        )))
+                                        .ghost()
+                                        .small()
+                                        .label("重连")
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                let Some(config) = this
+                                                    .config
+                                                    .mcp_servers
+                                                    .iter()
+                                                    .find(|s| s.name == retry_name)
+                                                    .cloned()
+                                                else {
+                                                    return;
+                                                };
+                                                let mcp = this.mcp.clone();
+                                                let tx = this.runtime_tx.clone();
+                                                this.start_pump(cx);
+                                                thread::spawn(move || {
+                                                    let _ = mcp.connect(&config, &workspace_dir());
+                                                    let _ = tx.send(RuntimeUpdate {
+                                                        statuses: mcp.statuses(),
+                                                    });
+                                                });
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        Button::new(SharedString::from(format!(
+                                            "mcp-disconnect-{index}"
+                                        )))
+                                        .ghost()
+                                        .small()
+                                        .label("断开")
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.config.mcp_servers[index].enabled = false;
+                                                this.sync_mcp_editor(window, cx);
+                                                this.save_config(cx);
+                                                let mcp = this.mcp.clone();
+                                                let tx = this.runtime_tx.clone();
+                                                let name = disconnect_name.clone();
+                                                this.start_pump(cx);
+                                                thread::spawn(move || {
+                                                    mcp.disconnect(&name);
+                                                    let _ = tx.send(RuntimeUpdate {
+                                                        statuses: mcp.statuses(),
+                                                    });
+                                                });
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        Button::new(SharedString::from(format!(
+                                            "mcp-remove-{index}"
+                                        )))
+                                        .ghost()
+                                        .small()
+                                        .label("移除")
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.config.mcp_servers.remove(index);
+                                                this.sync_mcp_editor(window, cx);
+                                                this.save_config(cx);
+                                                this.reconnect_mcp(cx);
+                                            }),
+                                        ),
+                                    ),
+                            )
+                    }),
+            )
+            .child(div().text_sm().child("高级配置：修改环境变量、认证或超时"))
+            .child(Textarea::new(&self.mcp_config).h(px(220.)))
+            .child(
+                Button::new("apply-mcp-json")
+                    .label("应用配置并连接")
+                    .on_click(cx.listener(|this, _, _, cx| this.apply_mcp_config(cx))),
             )
     }
 }
