@@ -1,0 +1,16 @@
+# 本地参考实现，不进仓库
+examples/
+
+# Rust 编译产物。preview/target 会有数 GB
+target/
+
+# 预览编译时留下的临时日志
+preview/build-err.txt
+
+# 编辑器与系统
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+.idea/
+.vscode/

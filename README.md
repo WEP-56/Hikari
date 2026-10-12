@@ -1,5 +1,8 @@
 # Hikari
 
-后续开发在 `main` 进行。
+基于 Rust、[Gpui_kit](https://gpui-kit.com/) 实现的伴侣型个人助手，定义它的性格，在所有对话中养成你们的关系吧。
 
-上一版代码和全部提交历史在 [`old`](https://github.com/WEP-56/Hikari/tree/old) 分支（`cebea88`，2026-02-14）。发行标签 `v1.0.0`、`beta-v1.0.0` 仍指向旧代码。
+
+## 致谢
+- 长期记忆参考了 [hindsight](https://github.com/vectorize-io/hindsight) ，并使用 rust 复现了轻量版的 memory core；
+- agent core基于 [pi_agent_rust](https://github.com/Dicklesworthstone/pi_agent_rust1) 二次开发
