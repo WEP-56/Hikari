@@ -5,6 +5,7 @@ use hikari_runtime::Session;
 
 fn assistant(text: &str, thinking: &str, calls: Vec<ToolCall>) -> Message {
     Message::Assistant {
+        origin: None,
         text: text.into(),
         thinking: thinking.into(),
         tool_calls: calls,
@@ -26,7 +27,9 @@ fn fixture() -> Session {
             assistant("目前正文是纯文本，工具结果默认展开。接下来会把过程信息与最终回答分开。", "", vec![]),
             assistant("已完成消息界面的检查，建议优先调整以下三点：\n\n- **Markdown 正文**：支持列表、表格、引用与 `inline code`。\n- **执行过程**：完成后默认收起，保留中间说明与工具记录。\n- **工具详情**：按需查看参数与输出，失败状态清晰可见。\n\n你可以继续在 [GPUI-kit 文档](https://gpui-kit.com/) 中查看富文本组件的用法。", "", vec![]),
         ],
-        context: vec![], retained_until: 0, usage: Usage::default(),
+        context: vec![], retained_until: 0,
+        context_base: 0,
+        memory_enabled: true, usage: Usage::default(),
     }
 }
 
@@ -381,6 +384,24 @@ fn chat_ui_interactions() {
                     assert_eq!(app.agent_directory(), default);
                 });
                 checkpoint(window, cx, "new conversation workspace selector");
+                view.update(cx, |app,cx| {
+                    app.settings=true;
+                    app.section=crate::Section::Memory;
+                    app.memory_core.as_ref().unwrap().status().unwrap();
+                    app.memory_source = "来源原文含有 ``` 和 Markdown # 标题".into();
+                    cx.notify();
+                });
+                checkpoint(window,cx,"memory settings and manager");
+                view.update(cx, |app,cx| {
+                    app.section=crate::Section::Persona;
+                    let saved=app.persona_store.load().unwrap();
+                    app.persona_editor.update(cx,|state,cx|state.set_value(saved.clone(),window,cx));
+                    assert!(app.persona_store.prompt().unwrap().contains(&saved));
+                    cx.notify();
+                });
+                checkpoint(window,cx,"global persona editor");
+                view.update(cx, |app,cx|{app.persona_preview=true;cx.notify();});
+                checkpoint(window,cx,"global persona Markdown preview");
                 cx.quit();
             }).unwrap();
         }).detach();

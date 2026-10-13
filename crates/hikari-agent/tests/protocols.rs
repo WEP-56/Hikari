@@ -45,9 +45,11 @@ fn responses_fragmented_call_keeps_native_reasoning_and_replays_result() {
         .unwrap();
     let messages = [
         Message::User {
+            origin: None,
             text: "读取".into(),
         },
         Message::Assistant {
+            origin: None,
             text: String::new(),
             thinking: String::new(),
             tool_calls: Vec::new(),
@@ -108,6 +110,7 @@ fn anthropic_signed_thinking_and_multiple_tool_results_roundtrip() {
     let messages = [
         Message::user("go"),
         Message::Assistant {
+            origin: None,
             text: String::new(),
             thinking: "想一想".into(),
             tool_calls: Vec::new(),
@@ -206,6 +209,7 @@ fn chat_completions_reads_usage_after_finish_reason_over_http() {
 #[test]
 fn protocol_metadata_survives_session_serialization() {
     let message = Message::Assistant {
+        origin: None,
         text: "answer".into(),
         thinking: "reason".into(),
         tool_calls: Vec::new(),

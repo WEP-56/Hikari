@@ -20,8 +20,8 @@ pub use agent::{
 };
 pub use error::{AgentError, Result};
 pub use memory::{
-    ConsolidateReceipt, ConsolidateState, Memory, NullMemory, RecallItem, RetainReceipt,
-    RetainState,
+    ConsolidateReceipt, ConsolidateState, Memory, MemoryJobEvent, NullMemory, RecallItem,
+    RetainReceipt, RetainState,
 };
 pub use model::{Message, ProviderMetadata, StopReason, ToolCall, Usage};
 pub use openai::OpenAiProvider;

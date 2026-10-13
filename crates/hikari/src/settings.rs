@@ -270,6 +270,10 @@ impl Preview {
     }
     pub(super) fn discard_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.config = self.saved_config.clone();
+        if let Ok(card) = self.persona_store.load() {
+            self.persona_editor
+                .update(cx, |state, cx| state.set_value(card, window, cx));
+        }
         self.reload_editors(window, cx);
         self.set_dark(self.config.dark, window, cx);
         self.settings_dirty = false;
@@ -700,7 +704,9 @@ impl Preview {
             self.model.clone(),
             self.key.clone(),
             self.key_env.clone(),
-            self.call_name.clone(),
+            self.memory_path.clone(),
+            self.memory_tokens.clone(),
+            self.memory_items.clone(),
             self.settings_draft.name.clone(),
             self.settings_draft.context.clone(),
             self.settings_draft.output.clone(),
@@ -735,7 +741,9 @@ impl Preview {
             self.write_editor_into(&mut config, &id, cx)?;
         }
         config.max_tool_rounds = number(&self.settings_draft.rounds, "工具轮数", cx)?;
-        config.persona_name = read(&self.call_name, cx);
+        config.memory.database = read(&self.memory_path, cx);
+        config.memory.auto_tokens = number(&self.memory_tokens, "自动召回 tokens", cx)?;
+        config.memory.auto_items = number(&self.memory_items, "自动召回条数", cx)?;
         config.dark = self.dark;
         config.appearance = self.read_appearance(cx)?;
         config.sync_active()?;
@@ -859,11 +867,17 @@ impl Preview {
         cx.notify();
     }
     fn fill_global_editors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let persona = self.config.persona_name.clone();
+        let memory = self.config.memory.clone();
+        self.memory_path
+            .update(cx, |state, cx| state.set_value(memory.database, window, cx));
+        self.memory_tokens.update(cx, |state, cx| {
+            state.set_value(memory.auto_tokens.to_string(), window, cx)
+        });
+        self.memory_items.update(cx, |state, cx| {
+            state.set_value(memory.auto_items.to_string(), window, cx)
+        });
         let rounds = self.config.max_tool_rounds.to_string();
         let appearance = self.config.appearance.clone();
-        self.call_name
-            .update(cx, |state, cx| state.set_value(persona, window, cx));
         self.settings_draft
             .rounds
             .update(cx, |state, cx| state.set_value(rounds, window, cx));

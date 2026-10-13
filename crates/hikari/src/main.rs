@@ -12,13 +12,12 @@ use gpui_kit::component::{
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::*;
 use hikari_agent::{
-    companion_prompt, run_turn_with_control, AgentEvent, ConsolidateState, Message as AgentMessage,
-    NullMemory, ProtocolProvider, RetainState, ToolRegistry, TurnControl, TurnHost, TurnRequest,
-    Usage,
+    run_turn_with_control, AgentEvent, ConsolidateState, Message as AgentMessage, NullMemory,
+    ProtocolProvider, RetainState, ToolRegistry, TurnControl, TurnHost, TurnRequest, Usage,
 };
 use hikari_runtime::{
-    AppConfig, ConfigStore, McpManager, McpServerConfig, McpStatus, McpTransport, Session,
-    SessionStore, SkillCatalog,
+    AppConfig, ConfigStore, McpManager, McpServerConfig, McpStatus, McpTransport, MemoryCore,
+    MemoryModels, PersonaStore, Session, SessionStore, SkillCatalog,
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -30,6 +29,7 @@ use std::thread;
 use std::time::Duration;
 
 mod chat;
+mod memory_ui;
 mod settings;
 mod shell;
 mod workspace;
@@ -105,6 +105,8 @@ struct Talk {
     lines: Vec<Line>,
     messages: Vec<AgentMessage>,
     retained_until: usize,
+    context_base: usize,
+    memory_enabled: bool,
     transcript: Vec<AgentMessage>,
     usage: Usage,
     view: chat::ChatState,
@@ -188,7 +190,21 @@ struct Preview {
     settings: bool,
     section: Section,
     dark: bool,
-    memory_on: bool,
+    new_memory: bool,
+    memory_core: Option<Arc<MemoryCore>>,
+    memory_models: Arc<MemoryModels>,
+    memory_events: Option<Receiver<hikari_agent::MemoryJobEvent>>,
+    memory_status: String,
+    memory_path: Entity<InputState>,
+    memory_tokens: Entity<InputState>,
+    memory_items: Entity<InputState>,
+    memory_query: Entity<InputState>,
+    memory_units: Vec<hikari_runtime::MemoryUnit>,
+    memory_offset: usize,
+    memory_source: String,
+    persona_store: PersonaStore,
+    persona_editor: Entity<TextareaState>,
+    persona_preview: bool,
     terminal_open: bool,
     terminal_text: String,
     terminal_error: Option<String>,
@@ -202,7 +218,6 @@ struct Preview {
     model: Entity<InputState>,
     key: Entity<InputState>,
     key_env: Entity<InputState>,
-    call_name: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
     config: AppConfig,
     config_store: ConfigStore,
@@ -265,6 +280,38 @@ impl Preview {
             management_notice = format!("无法创建 Hikari Skills 目录：{e}");
         }
         let settings_draft = settings::SettingsDraft::new(&config, window, cx);
+        let persona_store = PersonaStore::new(&data_dir);
+        let card = persona_store
+            .initialize(&config.persona_name)
+            .unwrap_or_else(|e| {
+                management_notice = e.message;
+                String::new()
+            });
+        let persona_editor = cx.new(|cx| {
+            let mut state = TextareaState::new(window, cx);
+            state.set_value(card, window, cx);
+            state
+        });
+        let memory_path =
+            cx.new(|cx| InputState::new(window, cx).default_value(config.memory.database.clone()));
+        let memory_tokens = cx.new(|cx| {
+            InputState::new(window, cx).default_value(config.memory.auto_tokens.to_string())
+        });
+        let memory_items = cx.new(|cx| {
+            InputState::new(window, cx).default_value(config.memory.auto_items.to_string())
+        });
+        let memory_query =
+            cx.new(|cx| InputState::new(window, cx).placeholder("搜索观察或事实，留空查看全部"));
+        let memory_models = MemoryModels::new(&config);
+        let db_path = data_dir.join(&config.memory.database);
+        let (memory_core, memory_events, memory_status) =
+            match MemoryCore::open(&db_path, config.memory.enabled) {
+                Ok((core, events)) => {
+                    core.set_processor(memory_models.clone());
+                    (Some(core), Some(events), "记忆库已初始化".to_string())
+                }
+                Err(err) => (None, None, format!("记忆初始化失败：{}", err.message)),
+            };
         let saved_config = config.clone();
         let (settings_tx, settings_rx) = mpsc::channel();
         let draft = cx.new(|cx| {
@@ -302,8 +349,6 @@ impl Preview {
         let key_env = cx.new(|cx| {
             InputState::new(window, cx).default_value(config.provider.api_key_env.clone())
         });
-        let call_name =
-            cx.new(|cx| InputState::new(window, cx).default_value(config.persona_name.clone()));
         let skill_path = cx
             .new(|cx| InputState::new(window, cx).placeholder("Skill 目录或包含多个 Skill 的目录"));
         let mcp_config = cx.new(|cx| {
@@ -336,10 +381,24 @@ impl Preview {
         });
 
         let (event_tx, event_rx) = mpsc::channel();
-        let sessions = session_store.load().unwrap_or_else(|e| {
+        let mut sessions = session_store.load().unwrap_or_else(|e| {
             management_notice = e.message;
             Vec::new()
         });
+        if let Some(core) = &memory_core {
+            let errors = hikari_runtime::memory::recover_memory(
+                core,
+                &memory_models,
+                &config,
+                &mut sessions,
+            );
+            if !errors.is_empty() {
+                management_notice = errors.join("\n");
+            }
+            if let Err(e) = session_store.save(&sessions) {
+                management_notice = e.message;
+            }
+        }
         let next_talk_id = sessions.iter().map(|s| s.id).max().unwrap_or(0) + 1;
         let talks = sessions.into_iter().map(talk_from_session).collect();
         let (runtime_tx, runtime_rx) = mpsc::channel();
@@ -382,7 +441,21 @@ impl Preview {
             settings: false,
             section: Section::Provider,
             dark: config.dark,
-            memory_on: false,
+            new_memory: true,
+            memory_core,
+            memory_models,
+            memory_events,
+            memory_status,
+            memory_path,
+            memory_tokens,
+            memory_items,
+            memory_query,
+            memory_units: Vec::new(),
+            memory_offset: 0,
+            memory_source: String::new(),
+            persona_store,
+            persona_editor,
+            persona_preview: false,
             terminal_open: false,
             terminal_text: String::new(),
             terminal_error: None,
@@ -396,7 +469,6 @@ impl Preview {
             model,
             key,
             key_env,
-            call_name,
             _subscriptions: vec![search_sub, draft_sub, model_query_sub],
             config,
             config_store,
@@ -488,6 +560,8 @@ impl Preview {
                         lines: Vec::new(),
                         messages: Vec::new(),
                         retained_until: 0,
+                        context_base: 0,
+                        memory_enabled: self.new_memory,
                         transcript: Vec::new(),
                         usage: Usage::default(),
                         view: chat::ChatState::default(),
@@ -507,8 +581,22 @@ impl Preview {
         let start = self.talks[idx].lines.len() - 1;
         self.talks[idx].view.start(start);
         self.talks[idx].lines.push(Line::pending());
-        self.talks[idx].messages.push(AgentMessage::user(&text));
-        self.talks[idx].transcript.push(AgentMessage::user(&text));
+        if !self.talks[idx].memory_enabled || !self.saved_config.memory.enabled {
+            self.talks[idx].retained_until = self.talks[idx].messages.len();
+        }
+        let mut user_message = AgentMessage::user(&text);
+        user_message.stamp(
+            format!(
+                "talk-{talk_id}:{}",
+                self.talks[idx].context_base + self.talks[idx].messages.len()
+            ),
+            false,
+        );
+        self.talks[idx].messages.push(user_message.clone());
+        self.talks[idx].transcript.push(user_message);
+        if !self.talks[idx].memory_enabled || !self.saved_config.memory.enabled {
+            self.talks[idx].retained_until = self.talks[idx].messages.len();
+        }
         self.save_sessions();
         self.draft.update(cx, |state, cx| {
             state.set_value("", window, cx);
@@ -521,13 +609,45 @@ impl Preview {
         } else {
             key
         };
-        let name = self.saved_config.persona_name.clone();
-        let thinking =
-            THINKING[settings::effort_index(provider_config.reasoning_effort.as_deref())];
+        let persona_prompt = match self.persona_store.prompt() {
+            Ok(prompt) => prompt,
+            Err(err) => {
+                self.finish_pending(idx, &err.message);
+                cx.notify();
+                return;
+            }
+        };
         let messages = self.talks[idx].messages.clone();
         let retained_until = self.talks[idx].retained_until;
-        // 记忆核心还没接上。开关先留着，loop 里的 recall / retain 缝已经在。
-        let _memory_on = self.memory_on;
+        let context_base = self.talks[idx].context_base;
+        let memory_scope = if self.talks[idx].memory_enabled && self.saved_config.memory.enabled {
+            match &self.memory_core {
+                Some(core) => match hikari_runtime::memory::turn_memory(
+                    core,
+                    &self.memory_models,
+                    &self.saved_config,
+                    format!("talk-{talk_id}"),
+                    self.talks[idx]
+                        .workspace
+                        .as_ref()
+                        .map(|p| p.display().to_string()),
+                ) {
+                    Ok(scope) => Some(scope),
+                    Err(err) => {
+                        self.finish_pending(idx, &err.message);
+                        cx.notify();
+                        return;
+                    }
+                },
+                None => {
+                    self.finish_pending(idx, &self.memory_status.clone());
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
 
         let provider = match ProtocolProvider::new(provider_config.clone(), key.trim()) {
             Ok(provider) => provider,
@@ -567,24 +687,28 @@ impl Preview {
             let setup_error = skills
                 .register(&mut tools)
                 .and_then(|_| mcp.register(&mut tools))
+                .and_then(|_| {
+                    memory_scope
+                        .as_ref()
+                        .map(|scope| scope.register(&mut tools).map_err(|e| e.message))
+                        .unwrap_or(Ok(()))
+                })
                 .err();
             let host = TurnHost {
                 provider: Arc::new(provider),
                 tools: Arc::new(tools),
-                memory: Arc::new(NullMemory),
+                memory: memory_scope
+                    .map(|scope| scope as Arc<dyn hikari_agent::Memory>)
+                    .unwrap_or_else(|| Arc::new(NullMemory)),
                 abort,
             };
             let request = TurnRequest {
                 session_id: format!("talk-{talk_id}"),
                 messages,
                 retained_until,
+                context_base,
                 query: text.clone(),
-                system_prompt: format!(
-                    "{}{}{}",
-                    companion_prompt(&name, thinking),
-                    skills.prompt(),
-                    directory_prompt
-                ),
+                system_prompt: format!("{}{}{}", persona_prompt, skills.prompt(), directory_prompt),
                 context_limit_tokens: provider_config.context_tokens,
                 max_tool_rounds,
             };
@@ -601,6 +725,7 @@ impl Preview {
                     error: Some(error),
                     usage: Usage::default(),
                     retained_until,
+                    context_base,
                 });
                 return;
             }
@@ -617,6 +742,7 @@ impl Preview {
                         error: Some("内部出错了。".into()),
                         usage: Usage::default(),
                         retained_until,
+                        context_base,
                     },
                 });
             }
@@ -640,6 +766,40 @@ impl Preview {
 
     fn drain_events(&mut self, cx: &mut Context<Self>) {
         self.drain_settings(cx);
+        while let Some(event) = self
+            .memory_events
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        {
+            if let Some(idx) = event
+                .session_id
+                .strip_prefix("talk-")
+                .and_then(|id| id.parse::<u64>().ok())
+                .and_then(|id| self.talks.iter().position(|t| t.id == id))
+            {
+                let note = if let Some(error) = event.error {
+                    Some(format!("记忆任务失败 · {error}"))
+                } else if event.state == "done" && event.kind == "extract" && event.kept > 0 {
+                    Some(format!("记下了 {} 件", event.kept))
+                } else {
+                    None
+                };
+                if let Some(note) = note {
+                    self.talks[idx].lines.push(Line::note(note));
+                }
+            }
+            cx.notify();
+        }
+        if let Some(core) = &self.memory_core {
+            let next = match core.status() {
+                Ok(status) => format!("事实 {} · 观察 {} · 排队 {} · 运行 {} · 失败 {}\n辅助模型 tokens：输入 {} / 输出 {}{}",status["facts"],status["observations"],status["queued"],status["running"],status["failed"],status["input_tokens"],status["output_tokens"],status["last_error"].as_str().map(|e|format!("\n{e}")).unwrap_or_default()),
+                Err(error) => format!("记忆状态读取失败：{}", error.message),
+            };
+            if next != self.memory_status {
+                self.memory_status = next;
+                cx.notify();
+            }
+        }
         while let Ok(update) = self.runtime_rx.try_recv() {
             self.mcp_statuses = update.statuses;
             cx.notify();
@@ -662,7 +822,23 @@ impl Preview {
             return;
         };
         let follow = self.talks[idx].view.near_bottom();
+        let persist = matches!(
+            &event,
+            AgentEvent::Checkpoint { .. } | AgentEvent::AgentEnd { .. }
+        );
         match event {
+            AgentEvent::Checkpoint {
+                messages,
+                retained_until,
+                context_base,
+            } => {
+                self.talks[idx].messages = messages;
+                self.talks[idx].retained_until = retained_until;
+                self.talks[idx].context_base = context_base;
+            }
+            AgentEvent::MemoryError { error } => {
+                self.talks[idx].lines.push(Line::note(error));
+            }
             AgentEvent::InputDelivered { text } => {
                 self.talks[idx].lines.push(Line::user(text.clone()));
                 self.talks[idx].transcript.push(AgentMessage::user(text));
@@ -802,6 +978,7 @@ impl Preview {
                 error,
                 usage,
                 retained_until,
+                context_base,
             } => {
                 if !messages.is_empty() {
                     self.talks[idx].messages = messages;
@@ -809,6 +986,7 @@ impl Preview {
                 self.usage = usage;
                 self.talks[idx].usage = usage;
                 self.talks[idx].retained_until = retained_until;
+                self.talks[idx].context_base = context_base;
                 self.finish_pending(idx, error.as_deref().unwrap_or(""));
                 if gen == self.turn_gen {
                     self.busy = false;
@@ -846,8 +1024,10 @@ impl Preview {
                         }
                     }
                 }
-                self.save_sessions();
             }
+        }
+        if persist {
+            self.save_sessions();
         }
         if follow {
             self.talks[idx].view.scroll.scroll_to_bottom();
@@ -929,7 +1109,7 @@ fn talk_from_session(session: Session) -> Talk {
         .transcript
         .iter()
         .filter_map(|message| match message {
-            AgentMessage::User { text } => Some(Line::user(text.clone())),
+            AgentMessage::User { text, .. } => Some(Line::user(text.clone())),
             AgentMessage::Assistant { text, thinking, .. }
                 if !text.is_empty() || !thinking.is_empty() =>
             {
@@ -946,6 +1126,7 @@ fn talk_from_session(session: Session) -> Talk {
                 name,
                 text,
                 is_error,
+                ..
             } => Some(Line {
                 body: LineBody::Tool {
                     id: tool_call_id.clone(),
@@ -982,6 +1163,8 @@ fn talk_from_session(session: Session) -> Talk {
         messages: session.context,
         transcript: session.transcript,
         retained_until: session.retained_until,
+        context_base: session.context_base,
+        memory_enabled: session.memory_enabled,
         usage: session.usage,
         view: chat::ChatState::default(),
     }
@@ -1554,6 +1737,7 @@ impl Preview {
                         .child(self.workspace_selector(cx))
                         .child(self.workspace_browse(cx)),
                 )
+                .child(self.session_memory_switch(cx))
                 .into_any_element()
         };
         div().flex_1().min_h_0().child(body)
@@ -1671,7 +1855,12 @@ impl Preview {
     }
 
     fn run_config(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        self.model_menu(cx)
+        h_flex()
+            .gap_2()
+            .child(self.model_menu(cx))
+            .when(self.active.is_some(), |row| {
+                row.child(self.session_memory_switch(cx))
+            })
     }
 }
 
@@ -2093,8 +2282,18 @@ impl Preview {
             Ok(config)
         }) {
             Ok(config) => {
+                if self.saved_config.memory.enabled != config.memory.enabled {
+                    for talk in &mut self.talks {
+                        talk.retained_until = talk.messages.len();
+                    }
+                    self.save_sessions();
+                }
                 self.config = config.clone();
                 self.saved_config = config;
+                self.memory_models.update(&self.saved_config);
+                if let Some(core) = &self.memory_core {
+                    core.set_enabled(self.saved_config.memory.enabled);
+                }
                 self.settings_dirty = false;
                 self.apply_typography(cx);
                 self.management_notice = "设置已保存，下一轮请求使用已保存配置。".into();
@@ -2115,6 +2314,8 @@ impl Preview {
                 transcript: talk.transcript.clone(),
                 context: talk.messages.clone(),
                 retained_until: talk.retained_until,
+                context_base: talk.context_base,
+                memory_enabled: talk.memory_enabled,
                 usage: talk.usage,
             })
             .collect();
@@ -2411,43 +2612,6 @@ impl Preview {
                     ),
             )
             .child(self.typography_page(cx))
-    }
-
-    fn memory_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors.clone();
-        v_flex()
-            .gap_4()
-            .child(page_title(
-                "记忆",
-                "记得住的事会自己收好。用不到的，不会拿来打扰你。",
-                theme,
-            ))
-            .child(
-                Switch::new("memory")
-                    .label("让 Hikari 记住")
-                    .checked(self.memory_on)
-                    .on_change(cx.listener(|this, value, _, cx| {
-                        this.memory_on = *value;
-                        cx.notify();
-                    })),
-            )
-    }
-
-    fn persona_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors.clone();
-        v_flex()
-            .gap_4()
-            .child(page_title(
-                "人格",
-                "它怎么称呼自己，说话轻不轻。",
-                theme.clone(),
-            ))
-            .child(field("名字", Input::new(&self.call_name), theme))
-            .child(
-                div()
-                    .text_sm()
-                    .child("先陪着，再办事。不催，不列清单，除非你要。"),
-            )
     }
 
     fn skill_page(&self, cx: &mut Context<Self>) -> impl IntoElement {

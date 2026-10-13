@@ -36,6 +36,8 @@ fn configuration_and_session_replace_previous_files_without_losing_transcript() 
         transcript: transcript.clone(),
         context: context.clone(),
         retained_until: 1,
+        context_base: 0,
+        memory_enabled: true,
         usage: Usage {
             input: 10,
             output: 5,

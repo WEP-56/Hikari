@@ -1,18 +1,31 @@
 use crate::error::Result;
 use crate::model::Message;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// 回复前注入的一条记忆。没有向量分。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecallItem {
     pub id: String,
     pub fact_type: String,
     pub text: String,
     pub proof_count: u32,
+    #[serde(default)]
+    pub mentioned_at: String,
+    #[serde(default)]
+    pub occurred_start: Option<String>,
+    #[serde(default)]
+    pub occurred_end: Option<String>,
+    #[serde(default)]
+    pub source_memory_ids: Vec<String>,
+    #[serde(default)]
+    pub is_stale: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetainState {
     Queued,
+    Persisted,
     Done,
     Failed,
 }
@@ -28,6 +41,21 @@ pub enum ConsolidateState {
 pub struct RetainReceipt {
     pub kept: u32,
     pub dropped: u32,
+    pub pending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryJobEvent {
+    pub session_id: String,
+    pub job_id: String,
+    pub document_id: String,
+    pub kind: String,
+    pub state: String,
+    pub kept: u32,
+    pub created: u32,
+    pub updated: u32,
+    pub deleted: u32,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +72,14 @@ pub trait Memory: Send + Sync {
     fn enabled(&self) -> bool;
 
     fn recall(&self, query: &str) -> Vec<RecallItem>;
+
+    fn recall_checked(&self, query: &str) -> Result<Vec<RecallItem>> {
+        Ok(self.recall(query))
+    }
+
+    fn policy(&self) -> &str {
+        ""
+    }
 
     fn retain(&self, document_id: &str, messages: &[Message]) -> Result<RetainReceipt>;
 
@@ -67,6 +103,7 @@ impl Memory for NullMemory {
         Ok(RetainReceipt {
             kept: 0,
             dropped: 0,
+            pending: false,
         })
     }
 
@@ -80,13 +117,14 @@ impl Memory for NullMemory {
 
 /// 同一段原文的指纹。重复提交时 Memory Core 用它挡住。
 pub fn content_hash(messages: &[Message]) -> String {
-    let bytes = serde_json::to_vec(messages).unwrap_or_default();
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(messages).expect("serializable messages"))
+    )
+}
+
+pub fn is_memory_tool(name: &str) -> bool {
+    matches!(name, "search_observations" | "recall" | "expand" | "forget")
 }
 
 #[cfg(test)]

@@ -769,7 +769,7 @@ fn raw_text(id: String, text: &str, ink: Ink, appearance: &AppearanceConfig) -> 
         .selectable(true)
 }
 
-fn literal_code(text: &str) -> String {
+pub(super) fn literal_code(text: &str) -> String {
     let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat(longest.max(2) + 1);
     format!("{fence}\n{text}\n{fence}")

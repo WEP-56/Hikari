@@ -61,6 +61,84 @@ impl Tool for Echo {
         Ok("tool evidence".into())
     }
 }
+
+#[test]
+fn recall_is_reused_during_tool_rounds_and_refreshes_for_identical_followup() {
+    struct Counting(std::sync::atomic::AtomicUsize);
+    impl hikari_agent::Memory for Counting {
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn recall(&self, _: &str) -> Vec<hikari_agent::RecallItem> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            vec![]
+        }
+        fn retain(&self, _: &str, _: &[Message]) -> Result<hikari_agent::RetainReceipt> {
+            Ok(hikari_agent::RetainReceipt {
+                kept: 0,
+                dropped: 0,
+                pending: true,
+            })
+        }
+        fn consolidate_pending(&self) -> Result<hikari_agent::ConsolidateReceipt> {
+            unreachable!()
+        }
+    }
+    struct Rounds {
+        round: Mutex<usize>,
+        control: Arc<TurnControl>,
+    }
+    impl Provider for Rounds {
+        fn stream(
+            &self,
+            _: &Context<'_>,
+            _: &AtomicBool,
+            emit: &mut dyn FnMut(StreamEvent),
+        ) -> Result<()> {
+            let mut round = self.round.lock().unwrap();
+            if *round < 2 {
+                emit(StreamEvent::ToolDelta {
+                    index: 0,
+                    id: Some(format!("tool-{round}")),
+                    name: Some("echo".into()),
+                    arguments: "{}".into(),
+                });
+                emit(StreamEvent::Done(StopReason::ToolUse));
+            } else {
+                if *round == 2 {
+                    self.control.follow_up("same");
+                }
+                emit(StreamEvent::Text("reply".into()));
+                emit(StreamEvent::Done(StopReason::Stop));
+            }
+            *round += 1;
+            Ok(())
+        }
+    }
+    let control = Arc::new(TurnControl::default());
+    let memory = Arc::new(Counting(std::sync::atomic::AtomicUsize::new(0)));
+    let host = TurnHost {
+        provider: Arc::new(Rounds {
+            round: Mutex::new(0),
+            control: control.clone(),
+        }),
+        tools: Arc::new(ToolRegistry::new(vec![Arc::new(Echo)])),
+        memory: memory.clone(),
+        abort: Arc::new(AtomicBool::new(false)),
+    };
+    let request = TurnRequest {
+        session_id: "s".into(),
+        messages: vec![Message::user("same")],
+        retained_until: 0,
+        context_base: 0,
+        query: "same".into(),
+        system_prompt: "base".into(),
+        context_limit_tokens: 128_000,
+        max_tool_rounds: 50,
+    };
+    run_turn_with_control(&host, request, &control, |_| {});
+    assert_eq!(memory.0.load(Ordering::SeqCst), 2);
+}
 #[test]
 fn steering_waits_for_tools_followup_waits_for_reply_and_sparse_tool_indexes_work() {
     let control = Arc::new(TurnControl::default());
@@ -79,6 +157,7 @@ fn steering_waits_for_tools_followup_waits_for_reply_and_sparse_tool_indexes_wor
         session_id: "session".into(),
         messages: vec![Message::user("initial")],
         retained_until: 0,
+        context_base: 0,
         query: "initial".into(),
         system_prompt: "base".into(),
         context_limit_tokens: 128_000,
@@ -141,6 +220,7 @@ fn cancellation_keeps_results_paired_with_every_unexecuted_tool_call() {
         session_id: "session".into(),
         messages: vec![Message::user("initial")],
         retained_until: 0,
+        context_base: 0,
         query: "initial".into(),
         system_prompt: "base".into(),
         context_limit_tokens: 128_000,

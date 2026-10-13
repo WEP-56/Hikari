@@ -396,7 +396,7 @@ pub fn request_body(config: &ProviderConfig, context: &Context<'_>) -> Value {
             let mut input = Vec::new();
             for message in context.messages {
                 match message {
-                    Message::User { text } => input.push(json!({"role":"user","content":text})),
+                    Message::User { text, .. } => input.push(json!({"role":"user","content":text})),
                     Message::Assistant { text, tool_calls, provider_metadata, .. } => {
                         if let Some(meta) = provider_metadata.as_ref().filter(|m| m.protocol == "responses") {
                             input.extend(meta.items.clone());
@@ -441,7 +441,7 @@ pub fn request_body(config: &ProviderConfig, context: &Context<'_>) -> Value {
             let mut messages: Vec<Value> = Vec::new();
             for message in context.messages {
                 let (role, content) = match message {
-                    Message::User { text } | Message::ContextSummary { text } => {
+                    Message::User { text, .. } | Message::ContextSummary { text } => {
                         ("user", vec![json!({"type":"text","text":text})])
                     }
                     Message::Assistant {

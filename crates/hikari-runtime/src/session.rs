@@ -15,7 +15,14 @@ pub struct Session {
     pub transcript: Vec<Message>,
     pub context: Vec<Message>,
     pub retained_until: usize,
+    #[serde(default)]
+    pub context_base: usize,
+    #[serde(default = "default_memory")]
+    pub memory_enabled: bool,
     pub usage: Usage,
+}
+fn default_memory() -> bool {
+    true
 }
 #[derive(Clone)]
 pub struct SessionStore {
@@ -28,7 +35,24 @@ impl SessionStore {
         }
     }
     pub fn load(&self) -> Result<Vec<Session>> {
-        read_json_or_default(&self.path)
+        let records: Vec<serde_json::Value> = read_json_or_default(&self.path)?;
+        records
+            .into_iter()
+            .map(|record| {
+                let legacy = record.get("memory_enabled").is_none();
+                let mut session: Session = serde_json::from_value(record)
+                    .map_err(|e| hikari_agent::AgentError::new(e.to_string()))?;
+                if legacy {
+                    // Enable future turns without silently ingesting old conversation history.
+                    session.retained_until = session.context.len();
+                    session.context_base = session
+                        .transcript
+                        .len()
+                        .saturating_sub(session.context.len());
+                }
+                Ok(session)
+            })
+            .collect()
     }
     pub fn save(&self, sessions: &[Session]) -> Result<()> {
         write_json(&self.path, &sessions)

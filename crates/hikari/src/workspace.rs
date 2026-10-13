@@ -76,6 +76,7 @@ impl Preview {
         self.stash_conversation_draft(cx);
         self.active = None;
         self.new_workspace = None;
+        self.new_memory = true;
         self.workspace_picker_generation += 1;
         self.workspace_notice.clear();
         self.usage = Usage::default();

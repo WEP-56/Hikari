@@ -1,6 +1,8 @@
 pub mod config;
 pub mod imports;
 pub mod mcp;
+pub mod memory;
+pub mod persona;
 pub mod preferences;
 pub mod session;
 pub mod skills;
@@ -8,7 +10,11 @@ pub mod updates;
 pub mod workspace;
 
 pub use config::{AppConfig, ConfigStore};
+pub use hikari_memory::Core as MemoryCore;
+pub use hikari_memory::Unit as MemoryUnit;
 pub use mcp::{McpManager, McpServerConfig, McpStatus, McpTransport};
+pub use memory::{MemoryConfig, MemoryModels};
+pub use persona::PersonaStore;
 pub use preferences::{AppearanceConfig, ModelMetadata, ProviderProfile};
 pub use session::{Session, SessionStore};
 pub use skills::{Skill, SkillCatalog};

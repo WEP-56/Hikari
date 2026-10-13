@@ -15,6 +15,7 @@ pub struct AppConfig {
     pub active_provider: String,
     pub appearance: AppearanceConfig,
     pub persona_name: String,
+    pub memory: crate::MemoryConfig,
     pub dark: bool,
     pub max_tool_rounds: usize,
     pub mcp_servers: Vec<McpServerConfig>,
@@ -34,6 +35,7 @@ impl Default for AppConfig {
             active_provider: "default".into(),
             appearance: AppearanceConfig::default(),
             persona_name: "光".into(),
+            memory: crate::MemoryConfig::default(),
             dark: true,
             max_tool_rounds: 50,
             mcp_servers: Vec::new(),
@@ -99,6 +101,17 @@ impl AppConfig {
         }
         self.provider.validate()?;
         self.appearance.validate()?;
+        self.memory.validate()?;
+        for reference in [&self.memory.extraction, &self.memory.consolidation] {
+            if !reference.provider_id.is_empty()
+                && !self.providers.iter().any(|p| {
+                    p.id == reference.provider_id
+                        && p.models.iter().any(|m| m.id == reference.model_id)
+                })
+            {
+                return Err(AgentError::new("记忆引用的提供商或模型不存在"));
+            }
+        }
         if !(1..=1000).contains(&self.max_tool_rounds) {
             return Err(AgentError::new("最大工具轮数需要在 1–1000 内"));
         }

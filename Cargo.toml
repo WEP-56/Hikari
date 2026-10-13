@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/hikari-agent", "crates/hikari-runtime", "crates/hikari"]
+members = ["crates/hikari-agent", "crates/hikari-runtime", "crates/hikari-memory", "crates/hikari"]
 default-members = ["crates/hikari"]
 resolver = "2"
 

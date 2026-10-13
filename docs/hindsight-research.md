@@ -199,6 +199,8 @@ final = relevance
 
 ## 第一版建议砍掉的
 
+**Hikari 已确定并实现的取舍（2026-10-13）**：本地 Rust/SQLite 单用户记忆库，不加载 embedding，不部署 Hindsight 服务。下文向量、图与融合是上游研究，不是 Hikari 当前依赖；实际检索为轻量中文词项、FTS5/BM25、实体线索和可选时间过滤。保留 document → world/experience → observation 架构、证据来源、后台沉淀、有限召回和按需展开。完整契约见 [pi-memory-plan.md](pi-memory-plan.md)。
+
 这些在上游是真的，但不是 Memory Core 的第一刀：
 
 - mental model：人预先写的一个问题，到点用 reflect 刷新成一篇文章。observation 已经是自动长出来的灵魂。mental model 以后再加。

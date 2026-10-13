@@ -124,7 +124,7 @@ fn wire_messages(system: &str, messages: &[Message]) -> Vec<Value> {
     let mut out = vec![json!({"role": "system", "content": system})];
     for message in messages {
         match message {
-            Message::User { text } => out.push(json!({"role": "user", "content": text})),
+            Message::User { text, .. } => out.push(json!({"role": "user", "content": text})),
             Message::ContextSummary { text } => out.push(json!({"role":"system","content":text})),
             Message::Assistant {
                 text, tool_calls, ..

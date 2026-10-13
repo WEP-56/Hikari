@@ -1,6 +1,6 @@
 # Pi 接入：第一阶段
 
-Hikari 的 agent 是 Pi 的改造版。第一阶段先接通桌面 agent、模型协议、MCP 和 Skill；Hindsight Memory Core 后续接入现有 `Memory` 边界。当前运行时使用 `NullMemory`。
+Hikari 的 agent 是 Pi 的改造版。桌面 agent、模型协议、MCP、Skill 与 Hindsight 风格 Memory Core 已接入现有 `Memory` 边界；未启用记忆的测试与会话仍使用 `NullMemory`。
 
 本地参考 `examples/pi_agent_rust` 来自 `b6fa9e18b`，是裁剪后的源码集合，缺少 Cargo manifest、HTTP/config/workspace/extension 等依赖模块，不能直接作为 path dependency 编译。使用可独立移植的模块和 Pi 的协议、执行边界，保留 GPUI 所需的薄适配。引用文件均保留来源注释，上游许可证全文位于 `licenses/pi_agent_rust.LICENSE`；它包含 OpenAI/Anthropic rider，分发时必须保留原条件。
 
@@ -27,7 +27,7 @@ cargo run
 
 桌面应用位于 `crates/hikari`，是根工作区的默认启动目标；也可使用 `cargo run -p hikari` 显式选择。编译产物统一位于根目录 `target`，发布构建命令为 `cargo build --release`。
 
-设置 → 提供商：选择 Chat Completions、Responses 或 Anthropic，填写服务地址和模型名字。API key 按提供商明文保存到本地配置，重启后恢复；留空时读取 `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` 或配置中的自定义环境变量。点击“保存设置”持久化密钥、协议、地址、模型、人格、主题及管理设置。
+设置 → 提供商：选择 Chat Completions、Responses 或 Anthropic，填写服务地址和模型名字。API key 按提供商明文保存到本地配置，重启后恢复；留空时读取 `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` 或配置中的自定义环境变量。点击“保存设置”持久化密钥、协议、地址、模型、记忆预算和主题。人格页独立保存全局 `.hikari/AGENTS.md` 角色卡。
 
 现在可添加、切换、重命名或删除多个提供商，分别保存模型列表与元数据。获取模型列表复用当前地址、认证、请求头和超时；接口只返回 ID 时不猜测模型能力。支持配置思考/图片能力、可用思考挡位、上下文与最大输出。图片能力仅作为元数据，聊天附件尚未实现。思考挡位映射到实际 `reasoning_effort`；上下文用量使用当前保存模型的上限。请求头为 JSON 字符串映射，认证值必须使用 `${ENV_NAME}`；Chat 的 token 参数名称、系统角色、流用量，以及 Responses 的服务端存储可配置。
 
@@ -35,7 +35,7 @@ cargo run
 
 本地数据位于 `.hikari/config.json` 和 `.hikari/sessions.json`，已 gitignore。会话保存完整 transcript、当前模型 context、usage 和 retain 游标；上下文压缩生成独立 `ContextSummary`，界面历史保留完整原文。
 
-运行中，“插入当前任务”在工具批次完成后的下一次模型请求生效；“排队”或 Enter 在本轮回复后进入下一轮。停止按钮取消运行；未消费的排队输入保留为会话旁注。配置/工具集合在一次运行开始时固定，新配置在下一次运行应用。
+运行中，“插入当前任务”在工具批次完成后的下一次模型请求生效；“排队”或 Enter 在本轮回复后进入下一轮。停止按钮取消运行；未消费的排队输入保留为会话旁注。通常配置/工具集合在一次运行开始时固定，新配置在下一次运行应用；全局关闭 Memory Core 保存后即时切断自动召回、记忆工具和原文提交，已运行的后台任务继续完成。
 
 ## MCP
 
@@ -84,13 +84,13 @@ Hikari 自己的 `.hikari/skills` 始终优先扫描。可扫描 Codex/Claude/He
 ## 验证与后续
 
 ```powershell
-cargo test -p hikari-agent -p hikari-runtime
+cargo test -p hikari-agent -p hikari-runtime -p hikari-memory -p hikari
 cargo check -p hikari
 cargo fmt --all -- --check
 ```
 
 测试使用本地 HTTP 与实际 stdio 测试进程，不请求付费模型。覆盖流式 framing、三种协议的关键工具回传、原生 reasoning/签名保存、Pi 恢复策略、BOM/CRLF 编辑、会话/config 重写、Skill 资源边界、MCP 握手/分页/调用/断开。
 
-需要后续真实服务验收：各模型网关、实际 MCP 服务、GPUI 交互与视觉检查。当前是文本及工具场景；图片、附件、MCP 非文本内容原生渲染和协议跨模型 reasoning 兼容留待后续。Memory Core 的后台 retain/consolidation、SQLite 存储与 recall 尚未实现。
+需要后续真实服务验收：各模型网关、实际 MCP 服务、GPUI 交互与视觉检查。当前是文本及工具场景；图片、附件、MCP 非文本内容原生渲染和协议跨模型 reasoning 兼容留待后续。Memory Core 使用本地 SQLite/WAL、后台抽取/沉淀、中文轻量 FTS5 索引和可恢复任务队列；支持自动 recall、search_observations、recall、expand、forget 及全局/会话开关。默认不加载 embedding 模型。
 
 协议核对使用了 [OpenAI streaming](https://developers.openai.com/api/docs/guides/streaming-responses)、[function calling](https://developers.openai.com/api/docs/guides/function-calling) 及 [MCP transports](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)。

@@ -6,9 +6,13 @@ use serde::{Deserialize, Serialize};
 pub enum Message {
     User {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<MessageOrigin>,
     },
     Assistant {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<MessageOrigin>,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         thinking: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -21,20 +25,34 @@ pub enum Message {
         name: String,
         text: String,
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<MessageOrigin>,
     },
     ContextSummary {
         text: String,
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MessageOrigin {
+    pub id: String,
+    pub mentioned_at: String,
+    #[serde(default)]
+    pub recalled: bool,
+}
+
 impl Message {
     pub fn user(text: impl Into<String>) -> Self {
-        Self::User { text: text.into() }
+        Self::User {
+            text: text.into(),
+            origin: None,
+        }
     }
 
     pub fn assistant(text: impl Into<String>) -> Self {
         Self::Assistant {
             text: text.into(),
+            origin: None,
             thinking: String::new(),
             tool_calls: Vec::new(),
             provider_metadata: None,
@@ -52,21 +70,22 @@ impl Message {
             name: name.into(),
             text: text.into(),
             is_error,
+            origin: None,
         }
     }
 
     pub fn text(&self) -> &str {
         match self {
-            Self::User { text } | Self::Assistant { text, .. } | Self::ToolResult { text, .. } => {
-                text
-            }
+            Self::User { text, .. }
+            | Self::Assistant { text, .. }
+            | Self::ToolResult { text, .. } => text,
             Self::ContextSummary { text } => text,
         }
     }
 
     pub fn chars(&self) -> usize {
         match self {
-            Self::User { text } => text.chars().count(),
+            Self::User { text, .. } => text.chars().count(),
             Self::Assistant {
                 text,
                 thinking,
@@ -82,6 +101,30 @@ impl Message {
             }
             Self::ToolResult { text, name, .. } => text.chars().count() + name.chars().count(),
             Self::ContextSummary { text } => text.chars().count(),
+        }
+    }
+    pub fn origin(&self) -> Option<&MessageOrigin> {
+        match self {
+            Self::User { origin, .. }
+            | Self::Assistant { origin, .. }
+            | Self::ToolResult { origin, .. } => origin.as_ref(),
+            _ => None,
+        }
+    }
+    pub fn stamp(&mut self, id: String, recalled: bool) {
+        match self {
+            Self::User { origin, .. }
+            | Self::Assistant { origin, .. }
+            | Self::ToolResult { origin, .. } => {
+                if origin.is_none() {
+                    *origin = Some(MessageOrigin {
+                        id,
+                        mentioned_at: chrono::Utc::now().to_rfc3339(),
+                        recalled,
+                    });
+                }
+            }
+            _ => {}
         }
     }
 }
