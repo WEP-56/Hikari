@@ -1587,6 +1587,7 @@ fn workspace_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .map(PathBuf::from)
+        .and_then(|path| path.parent().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
@@ -1663,7 +1664,7 @@ fn portrait_image() -> Arc<Image> {
         .get_or_init(|| {
             Arc::new(Image::from_bytes(
                 ImageFormat::Png,
-                include_bytes!("../../iconin.png").to_vec(),
+                include_bytes!("../resources/branding/portrait.png").to_vec(),
             ))
         })
         .clone()

@@ -408,7 +408,7 @@ mod tests {
             .call("read_file", r#"{"path":"Cargo.toml"}"#)
             .unwrap();
         assert!(out.contains("hikari-agent"), "{out}");
-        let outside = registry.call("read_file", r#"{"path":"../preview/Cargo.toml"}"#);
+        let outside = registry.call("read_file", r#"{"path":"../hikari/Cargo.toml"}"#);
         assert!(outside.is_err(), "{outside:?}");
     }
 }

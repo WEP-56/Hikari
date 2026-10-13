@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/hikari-agent", "crates/hikari-runtime", "preview"]
-default-members = ["crates/hikari-agent", "crates/hikari-runtime"]
+members = ["crates/hikari-agent", "crates/hikari-runtime", "crates/hikari"]
+default-members = ["crates/hikari"]
 resolver = "2"
 
 [profile.dev.package]

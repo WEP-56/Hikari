@@ -1,10 +1,30 @@
-![icon](assets/iconin.png)
+![icon](crates/hikari/resources/branding/portrait.png)
 
 # Hikari
 
 基于 Rust、[Gpui_kit](https://gpui-kit.com/) 实现的伴侣型个人助手，定义它的性格，在所有对话中养成你们的关系吧。
 
-当前第一阶段是 Pi agent 与 GPUI 接入：工具 loop、Chat Completions / Responses / Anthropic 协议、stdio / Streamable HTTP MCP、Skill 发现与按需加载、会话恢复。运行 `cargo run -p hikari`。实现范围、Pi 代码来源和配置说明见 [Pi 接入文档](docs/pi-port.md)。Hindsight Memory Core 尚待实现。
+
+## 运行
+
+在项目根目录 `E:\Hikari` 执行：
+
+```powershell
+cargo run
+```
+
+发布构建使用 `cargo build --release`，程序位于 `target/release/hikari.exe`。
+
+## 项目结构
+
+- `crates/hikari`：GPUI 桌面应用；形象资源位于 `resources/branding`。
+- `crates/hikari-agent`：Pi agent core 与模型协议。
+- `crates/hikari-runtime`：配置、会话、MCP 与 Skill 管理。
+- `assets`：README 页面截图。
+- `docs`：设计与接入文档。
+- `examples`：本地参考实现。
+
+工作区共用根目录的 `Cargo.lock` 和 `target`。
 
 
 ## visual

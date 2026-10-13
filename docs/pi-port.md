@@ -22,8 +22,10 @@ MCP 和 Skill 的上游实现已从本地参考目录删除，本阶段在 `hika
 在 `E:\Hikari` 执行：
 
 ```powershell
-cargo run -p hikari
+cargo run
 ```
+
+桌面应用位于 `crates/hikari`，是根工作区的默认启动目标；也可使用 `cargo run -p hikari` 显式选择。编译产物统一位于根目录 `target`，发布构建命令为 `cargo build --release`。
 
 设置 → 提供商：选择 Chat Completions、Responses 或 Anthropic，填写服务地址和模型名字。密钥输入框只用于本次运行；可在启动程序前设置 `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` 或配置中的自定义环境变量。点击“保存设置”持久化协议、地址、模型、人格、主题及管理设置，密钥值不写入配置。
 
