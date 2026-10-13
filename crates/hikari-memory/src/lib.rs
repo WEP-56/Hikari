@@ -137,6 +137,22 @@ pub struct Unit {
     pub consolidated: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BrowseView {
+    /// Observations and facts that have no surviving derived observation.
+    #[default]
+    Memory,
+    Facts,
+}
+impl BrowseView {
+    fn predicate(self) -> &'static str {
+        match self {
+            Self::Memory => "(u.kind='observation' OR NOT EXISTS (SELECT 1 FROM units o, json_each(o.data,'$.source_memory_ids') proof WHERE o.kind='observation' AND proof.value=u.id))",
+            Self::Facts => "u.kind!='observation'",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Source {
     id: String,
@@ -644,9 +660,12 @@ impl Core {
         Ok(())
     }
     pub fn browse(&self, query: &str, offset: usize) -> Result<Vec<Unit>> {
+        self.browse_view(query, offset, BrowseView::Memory)
+    }
+    pub fn browse_view(&self, query: &str, offset: usize, view: BrowseView) -> Result<Vec<Unit>> {
         let db = self.db.lock().unwrap();
         if !query.trim().is_empty() {
-            return Ok(search(
+            return Ok(search_in_view(
                 &db,
                 query,
                 &["world", "experience", "observation"],
@@ -654,13 +673,15 @@ impl Core {
                 200,
                 None,
                 None,
+                Some(view),
             )?
             .into_iter()
             .skip(offset)
             .take(25)
             .collect());
         }
-        let mut stmt = db.prepare("SELECT data FROM units ORDER BY julianday(json_extract(data,'$.mentioned_at')) DESC, rowid DESC LIMIT 25 OFFSET ?").map_err(error)?;
+        let sql = format!("SELECT u.data FROM units u WHERE {} ORDER BY julianday(json_extract(u.data,'$.mentioned_at')) DESC, u.rowid DESC LIMIT 25 OFFSET ?", view.predicate());
+        let mut stmt = db.prepare(&sql).map_err(error)?;
         let data = stmt
             .query_map([offset as i64], |r| r.get::<_, String>(0))
             .map_err(error)?
@@ -851,6 +872,19 @@ fn search(
     start: Option<&str>,
     end: Option<&str>,
 ) -> Result<Vec<Unit>> {
+    search_in_view(db, query, kinds, pending_only, limit, start, end, None)
+}
+#[allow(clippy::too_many_arguments)]
+fn search_in_view(
+    db: &Connection,
+    query: &str,
+    kinds: &[&str],
+    pending_only: bool,
+    limit: usize,
+    start: Option<&str>,
+    end: Option<&str>,
+    view: Option<BrowseView>,
+) -> Result<Vec<Unit>> {
     if query.len() > 4000 {
         return Err(error("记忆查询过长"));
     }
@@ -863,7 +897,8 @@ fn search(
         .map(|s| format!("\"{s}\""))
         .collect::<Vec<_>>()
         .join(" OR ");
-    let mut stmt = db.prepare("SELECT u.data FROM unit_search s JOIN units u ON u.id=s.id WHERE unit_search MATCH ? ORDER BY bm25(unit_search) LIMIT 200").map_err(error)?;
+    let sql = format!("SELECT u.data FROM unit_search s JOIN units u ON u.id=s.id WHERE unit_search MATCH ? AND {} ORDER BY bm25(unit_search) LIMIT 200", view.map(BrowseView::predicate).unwrap_or("1"));
+    let mut stmt = db.prepare(&sql).map_err(error)?;
     let data = stmt
         .query_map([expr], |r| r.get::<_, String>(0))
         .map_err(error)?

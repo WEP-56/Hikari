@@ -1,5 +1,5 @@
 use hikari_agent::{Memory, Message, ToolRegistry, Usage};
-use hikari_memory::{Core, MemoryConfig, Processor};
+use hikari_memory::{BrowseView, Core, MemoryConfig, Processor, Unit};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +12,80 @@ fn wait_done(events: &std::sync::mpsc::Receiver<hikari_agent::MemoryJobEvent>, k
             break;
         }
     }
+}
+
+#[test]
+fn memory_browser_groups_evidence_before_search_and_pagination() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("m.db");
+    let (core, _) = Core::open(&path, false).unwrap();
+    let db = rusqlite::Connection::open(path).unwrap();
+    let insert = |id: String, kind: &str, evidence: Vec<String>, consolidated: bool| {
+        let unit = Unit {
+            id: id.clone(),
+            text: format!("profile {id}"),
+            fact_type: kind.into(),
+            mentioned_at: "2026-10-13T09:00:00Z".into(),
+            occurred_start: None,
+            occurred_end: None,
+            created_at: "2026-10-13T09:00:00Z".into(),
+            updated_at: "2026-10-13T09:00:00Z".into(),
+            entities: vec![],
+            source_message_ids: vec![],
+            source_memory_ids: evidence,
+            document_id: None,
+            proof_count: 1,
+            metadata: json!({}),
+            consolidated,
+        };
+        db.execute(
+            "INSERT INTO units(id,kind,data,consolidated) VALUES(?,?,?,?)",
+            rusqlite::params![
+                id,
+                kind,
+                serde_json::to_string(&unit).unwrap(),
+                consolidated
+            ],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO unit_search(id,terms) VALUES(?,'profile')",
+            [&unit.id],
+        )
+        .unwrap();
+    };
+    for i in 0..30 {
+        insert(format!("fact-{i}"), "world", vec![], true);
+        insert(
+            format!("obs-{i}"),
+            "observation",
+            vec![format!("fact-{i}")],
+            true,
+        );
+    }
+    // A pending fact and a consolidated fact with no remaining observation stay visible.
+    insert("pending".into(), "world", vec![], false);
+    insert("orphan".into(), "experience", vec![], true);
+    for query in ["", "profile"] {
+        let first = core.browse(query, 0).unwrap();
+        let next = core.browse(query, 25).unwrap();
+        assert_eq!(first.len(), 25);
+        assert_eq!(next.len(), 7);
+        assert!(first
+            .iter()
+            .chain(&next)
+            .all(|u| !u.id.starts_with("fact-")));
+        assert!(first.iter().chain(&next).any(|u| u.id == "pending"));
+        assert!(first.iter().chain(&next).any(|u| u.id == "orphan"));
+        let facts = core.browse_view(query, 0, BrowseView::Facts).unwrap();
+        assert_eq!(facts.len(), 25);
+        assert!(facts.iter().all(|u| u.fact_type != "observation"));
+    }
+    db.execute("DELETE FROM units WHERE id='obs-0'", [])
+        .unwrap();
+    let mut after_delete = core.browse("profile", 0).unwrap();
+    after_delete.extend(core.browse("profile", 25).unwrap());
+    assert!(after_delete.iter().any(|u| u.id == "fact-0"));
 }
 
 #[test]

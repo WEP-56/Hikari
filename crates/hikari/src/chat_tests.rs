@@ -141,7 +141,7 @@ thread_local! {
     static BOUNDS: std::cell::RefCell<std::collections::BTreeMap<String, gpui_kit::Bounds<gpui_kit::Pixels>>> = Default::default();
 }
 
-pub(super) fn record_bounds(id: String, bounds: gpui_kit::Bounds<gpui_kit::Pixels>) {
+pub(crate) fn record_bounds(id: String, bounds: gpui_kit::Bounds<gpui_kit::Pixels>) {
     BOUNDS.with(|map| map.borrow_mut().insert(id, bounds));
 }
 
@@ -391,7 +391,52 @@ fn chat_ui_interactions() {
                     app.memory_source = "来源原文含有 ``` 和 Markdown # 标题".into();
                     cx.notify();
                 });
-                checkpoint(window,cx,"memory settings and manager");
+                checkpoint(window,cx,"memory manager");
+                for (section, name) in [
+                    (crate::Section::Appearance, "appearance"),
+                    (crate::Section::Skill, "skills"),
+                    (crate::Section::Mcp, "mcp"),
+                    (crate::Section::Channels, "channels"),
+                    (crate::Section::About, "about"),
+                ] {
+                    view.update(cx, |app,cx| { app.section=section; app.management_notice.clear(); cx.notify(); });
+                    checkpoint(window,cx,name);
+                }
+                view.update(cx, |app,cx| { app.section=crate::Section::Appearance; cx.notify(); });
+                window.click("fold-appearance-code",cx);
+                assert!(view.read(cx).settings_open.contains("appearance-code"));
+                checkpoint(window,cx,"appearance advanced expanded");
+                window.click("fold-appearance-code",cx);
+                assert!(!view.read(cx).settings_open.contains("appearance-code"));
+                view.update(cx, |app,cx| { app.section=crate::Section::Mcp; cx.notify(); });
+                window.click("fold-mcp-add",cx);
+                assert!(view.read(cx).settings_open.contains("mcp-add"));
+                checkpoint(window,cx,"mcp add expanded");
+                window.click("fold-mcp-add",cx);
+                for id in ["mcp-import", "mcp-advanced"] {
+                    window.click(&format!("fold-{id}"),cx);
+                    assert!(view.read(cx).settings_open.contains(id));
+                    checkpoint(window,cx,id);
+                    window.click(&format!("fold-{id}"),cx);
+                }
+                view.update(cx, |app,cx| { app.section=crate::Section::Skill; cx.notify(); });
+                for id in ["skill-directories", "skill-import"] {
+                    window.click(&format!("fold-{id}"),cx);
+                    assert!(view.read(cx).settings_open.contains(id));
+                    checkpoint(window,cx,id);
+                    window.click(&format!("fold-{id}"),cx);
+                }
+                for tab in [1,2] {
+                    view.update(cx, |app,cx| { app.section=crate::Section::Memory; app.memory_tab=tab; cx.notify(); });
+                    checkpoint(window,cx,if tab==1 { "memory configuration" } else { "memory tasks" });
+                }
+                view.update(cx, |app,cx| { app.memory_tab=1; cx.notify(); });
+                for id in ["memory-budget", "memory-storage"] {
+                    window.click(&format!("fold-{id}"),cx);
+                    assert!(view.read(cx).settings_open.contains(id));
+                    checkpoint(window,cx,id);
+                    window.click(&format!("fold-{id}"),cx);
+                }
                 view.update(cx, |app,cx| {
                     app.section=crate::Section::Persona;
                     let saved=app.persona_store.load().unwrap();

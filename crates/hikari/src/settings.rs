@@ -1,5 +1,13 @@
 use super::*;
-use gpui_kit::component::popover::Popover;
+use gpui_kit::component::{
+    checkbox::Checkbox,
+    popover::Popover,
+    select::{SearchableVec, Select, SelectEvent, SelectState},
+    IndexPath,
+};
+
+const CUSTOM_FONT: &str = "手动输入…";
+type FontSelect = SelectState<SearchableVec<String>>;
 use hikari_agent::{AgentError, ApiProtocol, ProviderConfig, Result};
 use hikari_runtime::imports::{import_skill, mcp_sources, merge_mcp, scan_mcp, skill_sources};
 use hikari_runtime::{AppearanceConfig, ModelMetadata, ProviderProfile};
@@ -31,6 +39,8 @@ pub(super) struct SettingsDraft {
     thinking: bool,
     images: bool,
     fonts: Vec<Entity<InputState>>,
+    font_selects: Vec<Entity<FontSelect>>,
+    custom_fonts: [bool; 3],
 }
 fn input(
     value: impl Into<SharedString>,
@@ -133,7 +143,7 @@ impl SettingsDraft {
             state
         });
         let a = &config.appearance;
-        let fonts = [
+        let fonts: Vec<_> = [
             a.text_font.clone(),
             a.text_size.to_string(),
             a.code_font.clone(),
@@ -146,6 +156,27 @@ impl SettingsDraft {
         .into_iter()
         .map(|v| input(v, window, cx))
         .collect();
+        let names = cx.text_system().all_font_names();
+        let font_selects = [0, 2, 4]
+            .into_iter()
+            .map(|index| {
+                let current = read(&fonts[index], cx);
+                let mut items = names.clone();
+                if !items.contains(&current) {
+                    items.push(current.clone());
+                }
+                items.sort_unstable_by_key(|name| name.to_lowercase());
+                let selected = items
+                    .iter()
+                    .position(|name| *name == current)
+                    .map(IndexPath::new);
+                items.push(CUSTOM_FONT.into());
+                cx.new(|cx| {
+                    SelectState::new(SearchableVec::new(items), selected, window, cx)
+                        .searchable(true)
+                })
+            })
+            .collect();
         Self {
             name: input(
                 profile.map(|p| p.name.clone()).unwrap_or_default(),
@@ -162,6 +193,8 @@ impl SettingsDraft {
             thinking: meta.supports_thinking,
             images: meta.supports_images,
             fonts,
+            font_selects,
+            custom_fonts: [false; 3],
         }
     }
 }
@@ -715,6 +748,27 @@ impl Preview {
             self.settings_draft.model_name.clone(),
             self.settings_draft.levels.clone(),
         ];
+        for (slot, select) in self.settings_draft.font_selects.iter().cloned().enumerate() {
+            self._subscriptions.push(cx.subscribe_in(
+                &select,
+                window,
+                move |this, _, event, window, cx| {
+                    if let SelectEvent::Confirm(Some(value)) = event {
+                        if value == CUSTOM_FONT {
+                            this.settings_draft.custom_fonts[slot] = true;
+                            this.settings_draft.fonts[slot * 2]
+                                .update(cx, |state, cx| state.focus(window, cx));
+                        } else {
+                            this.settings_draft.custom_fonts[slot] = false;
+                            this.settings_draft.fonts[slot * 2]
+                                .update(cx, |state, cx| state.set_value(value.clone(), window, cx));
+                            this.settings_dirty = true;
+                        }
+                        cx.notify();
+                    }
+                },
+            ));
+        }
         inputs.extend(self.settings_draft.fonts.clone());
         for state in inputs {
             self._subscriptions
@@ -894,6 +948,7 @@ impl Preview {
         for (state, value) in self.settings_draft.fonts.iter().cloned().zip(values) {
             state.update(cx, |state, cx| state.set_value(value, window, cx));
         }
+        self.sync_font_selects(window, cx);
     }
     fn fill_provider_editors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.provider_focus.clone() else {
@@ -1814,212 +1869,419 @@ impl Preview {
         });
         cx.notify();
     }
+    fn sync_font_selects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let names = cx.text_system().all_font_names();
+        for (slot, select) in self.settings_draft.font_selects.iter().cloned().enumerate() {
+            let current = read(&self.settings_draft.fonts[slot * 2], cx);
+            let mut items = names.clone();
+            if !items.contains(&current) {
+                items.push(current.clone());
+            }
+            items.sort_unstable_by_key(|name| name.to_lowercase());
+            items.push(CUSTOM_FONT.into());
+            select.update(cx, |state, cx| {
+                state.set_items(SearchableVec::new(items), window, cx);
+                state.set_selected_value(&current, window, cx);
+            });
+        }
+        self.settings_draft.custom_fonts = [false; 3];
+    }
     pub(super) fn typography_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors.clone();
-        v_flex()
+        let f = &self.settings_draft.fonts;
+        let font = |name: usize, size: usize, cx: &mut Context<Self>| {
+            let slot = name / 2;
+            let picker = if self.settings_draft.custom_fonts[slot] {
+                Input::new(&f[name])
+                    .suffix(
+                        Button::new(SharedString::from(format!("font-list-{slot}")))
+                            .ghost()
+                            .small()
+                            .icon(IconName::ChevronDown)
+                            .tooltip("选择已安装字体")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.sync_font_selects(window, cx);
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element()
+            } else {
+                Select::new(&self.settings_draft.font_selects[slot])
+                    .w_full()
+                    .min_w_0()
+                    .search_placeholder("搜索字体")
+                    .accessibility_label(["正文字体", "代码字体", "终端字体"][slot])
+                    .menu_max_h(px(320.))
+                    .into_any_element()
+            };
+            h_flex()
+                .gap_2()
+                .min_w_0()
+                .child(div().flex_1().min_w_0().child(picker))
+                .child(
+                    div()
+                        .w(px(92.))
+                        .flex_shrink_0()
+                        .child(Input::new(&f[size]).suffix("px")),
+                )
+        };
+        let text = v_flex()
+            .gap_4()
+            .child(settings_row("正文字体", font(0, 1, cx), cx))
+            .child(settings_row("正文行高", Input::new(&f[7]), cx))
+            .child(settings_row("界面字号", Input::new(&f[6]).suffix("px"), cx));
+        let advanced = v_flex()
+            .gap_4()
+            .child(settings_row("代码字体", font(2, 3, cx), cx))
+            .child(settings_row("终端字体", font(4, 5, cx), cx));
+        let preview = v_flex()
             .gap_3()
-            .children(
-                [
-                    "文本字体",
-                    "文本字号（10–32）",
-                    "代码字体",
-                    "代码字号（10–32）",
-                    "终端字体",
-                    "终端字号（10–32）",
-                    "界面字号（10–32）",
-                    "文本行高（1–2.5）",
-                ]
-                .into_iter()
-                .zip(&self.settings_draft.fonts)
-                .map(|(label, state)| field(label, Input::new(state), theme.clone())),
-            )
             .child(
-                div().text_xs().child(
-                    "填写已安装的字体名称。代码字体用于代码片段与工具输出，终端字体独立生效。",
-                ),
-            )
-            .child(
-                Button::new("preview-fonts")
-                    .label("预览字体")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        match this.read_appearance(cx) {
-                            Ok(a) => {
-                                this.config.appearance = a;
-                                this.apply_typography(cx);
-                                this.settings_dirty = true;
-                                this.management_notice = "字体预览已应用；保存后重启仍生效".into();
-                            }
-                            Err(e) => this.management_notice = e.message,
-                        }
-                        cx.notify();
-                    })),
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(settings_label("预览", cx))
+                    .child(
+                        Button::new("preview-fonts")
+                            .ghost()
+                            .small()
+                            .label("应用预览")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                match this.read_appearance(cx) {
+                                    Ok(a) => {
+                                        this.config.appearance = a;
+                                        this.apply_typography(cx);
+                                        this.settings_dirty = true;
+                                        this.management_notice.clear();
+                                    }
+                                    Err(e) => this.management_notice = e.message,
+                                }
+                                cx.notify();
+                            })),
+                    ),
             )
             .child(
                 div()
                     .font_family(self.config.appearance.text_font.clone())
                     .text_size(px(self.config.appearance.text_size))
-                    .child("文本预览 · Hikari 陪你做点什么。"),
+                    .child("Hikari 陪你做点什么。"),
             )
             .child(
                 div()
                     .font_family(self.config.appearance.code_font.clone())
                     .text_size(px(self.config.appearance.code_size))
                     .child("fn main() { println!(\"Hello, Hikari\"); }"),
-            )
-    }
-    pub(super) fn mcp_import_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().gap_2().p_3().rounded_lg().border_1().border_color(cx.theme().border)
-            .child(div().text_sm().child("从其他客户端导入 MCP"))
-            .child(div().text_xs().child("扫描 Claude / Codex / Hermes 的常用配置。只读取配置；导入的服务默认为停用，可逐项启用。"))
-            .child(Button::new("scan-mcp").ghost().label("扫描本机配置")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.external_mcp = scan_mcp(&mcp_sources(&home(), &workspace_dir()));
-                    this.mcp_selected = vec![true; this.external_mcp.candidates.len()]; cx.notify();
-                })))
-            .children(self.external_mcp.diagnostics.iter().map(|s| div().text_xs().child(s.clone())))
-            .when(!self.external_mcp.candidates.is_empty(), |v| v
-                .child(Button::new("select-all-mcp").ghost().small().label("全选 / 取消全选")
-                    .on_click(cx.listener(|this, _, _, cx| { let selected = !this.mcp_selected.iter().all(|s| *s); this.mcp_selected.fill(selected); cx.notify(); })))
-                .children(self.external_mcp.candidates.iter().enumerate().map(|(i, candidate)| {
-                    let detail = match &candidate.server.transport {
-                        McpTransport::Stdio { command, args, .. } => format!("{command} {}", args.join(" ")),
-                        McpTransport::StreamableHttp { url, .. } => url.clone(),
-                    };
-                    v_flex().gap_1().p_2()
-                        .child(Switch::new(SharedString::from(format!("import-mcp-{i}")))
-                            .label(format!("{} · {}{}", candidate.server.name, candidate.source,
-                                if self.config.mcp_servers.iter().any(|s| s.name == candidate.server.name) { " · 已存在" } else { "" }))
-                            .checked(self.mcp_selected[i])
-                            .on_change(cx.listener(move |this, value, _, cx| { this.mcp_selected[i] = *value; cx.notify(); })))
-                        .child(div().text_xs().child(detail))
-                        .child(div().text_xs().child(candidate.path.display().to_string()))
-                }))
-                .child(Switch::new("import-overwrite").label("覆盖已有同名配置").checked(self.import_overwrite)
-                    .on_change(cx.listener(|this, value, _, cx| { this.import_overwrite = *value; cx.notify(); })))
-                .child(Button::new("import-mcp").label(format!("导入 {} 项", self.mcp_selected.iter().filter(|s| **s).count()))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        match merge_mcp(&this.config.mcp_servers, &this.external_mcp.candidates, &this.mcp_selected, this.import_overwrite) {
-                            Ok(servers) => {
-                                let mut next = this.saved_config.clone(); next.mcp_servers = servers.clone();
-                                match this.config_store.save(&next) {
-                                    Ok(()) => { this.config.mcp_servers = servers; this.saved_config = next; this.sync_mcp_editor(window, cx); this.management_notice = "MCP 已导入并保存；启用服务后连接。".into(); }
-                                    Err(e) => this.management_notice = e.message,
-                                }
-                            }
-                            Err(e) => this.management_notice = e.message,
-                        } cx.notify();
-                    }))))
-    }
-    pub(super) fn skill_import_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().gap_2().p_3().rounded_lg().border_1().border_color(cx.theme().border)
-            .child(div().text_sm().child("Hikari Skills · .hikari/skills"))
-            .child(Button::new("scan-agent-skills").ghost().label("扫描 Codex / Claude / Hermes Skills")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    let sources = skill_sources(&home(), &workspace_dir());
-                    let roots: Vec<_> = sources.iter().map(|s| s.path.clone()).collect();
-                    this.external_skills = SkillCatalog::discover(&workspace_dir(), &roots, &[]);
-                    this.skill_selected = vec![false; this.external_skills.skills.len()];
-                    this.management_notice = sources.iter().map(|s| format!("{} · {} · {}", s.label, s.path.display(), if s.path.is_dir() { "已扫描" } else { "未找到" })).collect::<Vec<_>>().join("\n");
-                    cx.notify();
-                })))
-            .child(div().text_xs().child("也可在上方填写来源目录。复制导入会包含 Skill 的脚本与参考资料；已有同名 Skill 会保留。"))
-            .child(Button::new("scan-custom-skills").ghost().small().label("扫描填写的目录")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    let path = PathBuf::from(read(&this.skill_path, cx));
-                    if path.as_os_str().is_empty() { this.management_notice = "请先填写目录".into(); }
-                    else {
-                        this.external_skills = SkillCatalog::discover(&workspace_dir(), &[path], &[]);
-                        this.skill_selected = vec![false; this.external_skills.skills.len()];
-                    } cx.notify();
-                })))
-            .children(self.external_skills.diagnostics.iter().map(|s| div().text_xs().child(s.clone())))
-            .when(!self.external_skills.skills.is_empty(), |v| v
-                .child(Button::new("select-all-skills").ghost().small().label("全选 / 取消全选")
-                    .on_click(cx.listener(|this, _, _, cx| { let selected = !this.skill_selected.iter().all(|s| *s); this.skill_selected.fill(selected); cx.notify(); })))
-                .children(self.external_skills.skills.iter().enumerate().map(|(i, skill)| {
-                    v_flex().gap_1()
-                        .child(Switch::new(SharedString::from(format!("import-skill-{i}"))).label(skill.name.clone()).checked(self.skill_selected[i])
-                            .on_change(cx.listener(move |this, value, _, cx| { this.skill_selected[i] = *value; cx.notify(); })))
-                        .child(div().text_xs().child(skill.path.display().to_string()))
-                }))
-                .child(Button::new("copy-skills").label(format!("复制 {} 个 Skill 到 Hikari", self.skill_selected.iter().filter(|s| **s).count()))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        let mut count = 0; let mut errors = Vec::new();
-                        for (skill, selected) in this.external_skills.skills.iter().zip(&this.skill_selected) {
-                            if !selected { continue; }
-                            match import_skill(&skill.path, &workspace_dir().join(".hikari/skills")) { Ok(_) => count += 1, Err(e) => errors.push(format!("{}：{}", skill.name, e.message)) }
-                        }
-                        this.refresh_skills(cx);
-                        this.management_notice = format!("已导入 {count} 个 Skill\n{}", errors.join("\n")); cx.notify();
-                    }))))
-    }
-    pub(super) fn about_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+            );
         v_flex()
             .gap_4()
-            .child(portrait(px(96.)))
-            .child(page_title(
-                "Hikari",
-                "待在身边的助手。",
-                cx.theme().colors.clone(),
-            ))
-            .child(div().child(format!("版本 {}", env!("CARGO_PKG_VERSION"))))
-            .children(
-                [
-                    (
-                        "repository",
-                        "GitHub 仓库",
-                        "https://github.com/WEP-56/Hikari",
-                    ),
-                    (
-                        "issues",
-                        "问题反馈",
-                        "https://github.com/WEP-56/Hikari/issues",
-                    ),
-                    (
-                        "releases",
-                        "发布版本",
-                        "https://github.com/WEP-56/Hikari/releases",
-                    ),
-                ]
-                .into_iter()
-                .map(|(id, label, url)| {
-                    Button::new(id).ghost().label(label).on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            cx.open_url(url);
-                            this.management_notice.clear();
-                        },
-                    ))
-                }),
-            )
+            .child(settings_card(text, cx))
+            .child(self.settings_fold("appearance-code", "代码与终端", advanced, cx))
+            .child(settings_card(preview, cx))
+    }
+    pub(super) fn mcp_import_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_3()
+            .child(settings_label("Claude · Codex · Hermes", cx))
             .child(
-                Button::new("check-update")
-                    .label(if self.update_checking {
-                        "检查中…"
-                    } else {
-                        "检查更新"
-                    })
-                    .disabled(self.update_checking)
+                Button::new("scan-mcp")
+                    .ghost()
+                    .label("扫描本机配置")
                     .on_click(cx.listener(|this, _, _, cx| {
-                        let tx = this.settings_tx.clone();
-                        this.update_checking = true;
-                        this.start_pump(cx);
-                        thread::spawn(move || {
-                            let _ = tx.send(SettingsResult::Release(
-                                hikari_runtime::updates::check_release(env!("CARGO_PKG_VERSION")),
-                            ));
-                        });
+                        this.external_mcp = scan_mcp(&mcp_sources(&home(), &workspace_dir()));
+                        this.mcp_selected = vec![true; this.external_mcp.candidates.len()];
                         cx.notify();
                     })),
             )
-            .child(div().text_sm().child(self.update_notice.clone()))
+            .children(
+                self.external_mcp
+                    .diagnostics
+                    .iter()
+                    .map(|s| div().text_xs().child(s.clone())),
+            )
+            .when(!self.external_mcp.candidates.is_empty(), |v| {
+                v.child(
+                    Button::new("select-all-mcp")
+                        .ghost()
+                        .small()
+                        .label("全选 / 取消全选")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let selected = !this.mcp_selected.iter().all(|s| *s);
+                            this.mcp_selected.fill(selected);
+                            cx.notify();
+                        })),
+                )
+                .children(
+                    self.external_mcp
+                        .candidates
+                        .iter()
+                        .enumerate()
+                        .map(|(i, candidate)| {
+                            let detail = match &candidate.server.transport {
+                                McpTransport::Stdio { command, args, .. } => {
+                                    format!("{command} {}", args.join(" "))
+                                }
+                                McpTransport::StreamableHttp { url, .. } => url.clone(),
+                            };
+                            v_flex()
+                                .gap_1()
+                                .p_2()
+                                .child(
+                                    Checkbox::new(SharedString::from(format!("import-mcp-{i}")))
+                                        .label(format!(
+                                            "{} · {}{}",
+                                            candidate.server.name,
+                                            candidate.source,
+                                            if self
+                                                .config
+                                                .mcp_servers
+                                                .iter()
+                                                .any(|s| s.name == candidate.server.name)
+                                            {
+                                                " · 已存在"
+                                            } else {
+                                                ""
+                                            }
+                                        ))
+                                        .checked(self.mcp_selected[i])
+                                        .on_change(cx.listener(move |this, value, _, cx| {
+                                            this.mcp_selected[i] = *value;
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(div().text_xs().child(detail))
+                                .child(div().text_xs().child(candidate.path.display().to_string()))
+                        }),
+                )
+                .child(
+                    Switch::new("import-overwrite")
+                        .label("覆盖已有同名配置")
+                        .checked(self.import_overwrite)
+                        .on_change(cx.listener(|this, value, _, cx| {
+                            this.import_overwrite = *value;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("import-mcp")
+                        .label(format!(
+                            "导入 {} 项",
+                            self.mcp_selected.iter().filter(|s| **s).count()
+                        ))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            match merge_mcp(
+                                &this.config.mcp_servers,
+                                &this.external_mcp.candidates,
+                                &this.mcp_selected,
+                                this.import_overwrite,
+                            ) {
+                                Ok(servers) => {
+                                    let mut next = this.saved_config.clone();
+                                    next.mcp_servers = servers.clone();
+                                    match this.config_store.save(&next) {
+                                        Ok(()) => {
+                                            this.config.mcp_servers = servers;
+                                            this.saved_config = next;
+                                            this.sync_mcp_editor(window, cx);
+                                            this.management_notice =
+                                                "MCP 已导入并保存；启用服务后连接。".into();
+                                        }
+                                        Err(e) => this.management_notice = e.message,
+                                    }
+                                }
+                                Err(e) => this.management_notice = e.message,
+                            }
+                            cx.notify();
+                        })),
+                )
+            })
+    }
+    pub(super) fn skill_import_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_3()
+            .child(settings_label("Codex · Claude · Hermes · Agents", cx))
+            .child(
+                Button::new("scan-agent-skills")
+                    .ghost()
+                    .label("扫描 Codex / Claude / Hermes Skills")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let sources = skill_sources(&home(), &workspace_dir());
+                        let roots: Vec<_> = sources.iter().map(|s| s.path.clone()).collect();
+                        this.external_skills =
+                            SkillCatalog::discover(&workspace_dir(), &roots, &[]);
+                        this.skill_selected = vec![false; this.external_skills.skills.len()];
+                        this.management_notice.clear();
+                        cx.notify();
+                    })),
+            )
+            .child(Input::new(&self.skill_path))
+            .child(
+                Button::new("scan-custom-skills")
+                    .ghost()
+                    .small()
+                    .label("扫描填写的目录")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let path = PathBuf::from(read(&this.skill_path, cx));
+                        if path.as_os_str().is_empty() {
+                            this.management_notice = "请先填写目录".into();
+                        } else {
+                            this.external_skills =
+                                SkillCatalog::discover(&workspace_dir(), &[path], &[]);
+                            this.skill_selected = vec![false; this.external_skills.skills.len()];
+                        }
+                        cx.notify();
+                    })),
+            )
+            .children(
+                self.external_skills
+                    .diagnostics
+                    .iter()
+                    .map(|s| div().text_xs().child(s.clone())),
+            )
+            .when(!self.external_skills.skills.is_empty(), |v| {
+                v.child(
+                    Button::new("select-all-skills")
+                        .ghost()
+                        .small()
+                        .label("全选 / 取消全选")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let selected = !this.skill_selected.iter().all(|s| *s);
+                            this.skill_selected.fill(selected);
+                            cx.notify();
+                        })),
+                )
+                .children(
+                    self.external_skills
+                        .skills
+                        .iter()
+                        .enumerate()
+                        .map(|(i, skill)| {
+                            v_flex()
+                                .gap_1()
+                                .child(
+                                    Checkbox::new(SharedString::from(format!("import-skill-{i}")))
+                                        .label(skill.name.clone())
+                                        .checked(self.skill_selected[i])
+                                        .on_change(cx.listener(move |this, value, _, cx| {
+                                            this.skill_selected[i] = *value;
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(div().text_xs().child(skill.path.display().to_string()))
+                        }),
+                )
+                .child(
+                    Button::new("copy-skills")
+                        .label(format!(
+                            "复制 {} 个 Skill 到 Hikari",
+                            self.skill_selected.iter().filter(|s| **s).count()
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let mut count = 0;
+                            let mut errors = Vec::new();
+                            for (skill, selected) in
+                                this.external_skills.skills.iter().zip(&this.skill_selected)
+                            {
+                                if !selected {
+                                    continue;
+                                }
+                                match import_skill(
+                                    &skill.path,
+                                    &workspace_dir().join(".hikari/skills"),
+                                ) {
+                                    Ok(_) => count += 1,
+                                    Err(e) => errors.push(format!("{}：{}", skill.name, e.message)),
+                                }
+                            }
+                            this.refresh_skills(cx);
+                            this.management_notice =
+                                format!("已导入 {count} 个 Skill\n{}", errors.join("\n"));
+                            cx.notify();
+                        })),
+                )
+            })
+    }
+    pub(super) fn about_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let identity = h_flex()
+            .gap_4()
+            .items_center()
+            .child(portrait(px(64.)))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(settings_heading("Hikari"))
+                    .child(settings_label(
+                        format!("v{}", env!("CARGO_PKG_VERSION")),
+                        cx,
+                    ))
+                    .child(div().text_sm().child("有些对话，不必从头开始。")),
+            );
+        let links = h_flex().gap_2().flex_wrap().children(
+            [
+                ("repository", "GitHub", "https://github.com/WEP-56/Hikari"),
+                ("issues", "反馈", "https://github.com/WEP-56/Hikari/issues"),
+                (
+                    "releases",
+                    "发布记录",
+                    "https://github.com/WEP-56/Hikari/releases",
+                ),
+            ]
+            .into_iter()
+            .map(|(id, label, url)| {
+                Button::new(id)
+                    .ghost()
+                    .label(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.open_url(url);
+                        this.management_notice.clear();
+                    }))
+            }),
+        );
+        let updates = v_flex()
+            .gap_3()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(div().text_sm().child("版本更新"))
+                    .child(
+                        Button::new("check-update")
+                            .label(if self.update_checking {
+                                "检查中…"
+                            } else {
+                                "检查更新"
+                            })
+                            .disabled(self.update_checking)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let tx = this.settings_tx.clone();
+                                this.update_checking = true;
+                                this.start_pump(cx);
+                                thread::spawn(move || {
+                                    let _ = tx.send(SettingsResult::Release(
+                                        hikari_runtime::updates::check_release(env!(
+                                            "CARGO_PKG_VERSION"
+                                        )),
+                                    ));
+                                });
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .when(!self.update_notice.is_empty(), |v| {
+                v.child(settings_label(self.update_notice.clone(), cx))
+            })
             .when(self.release_url.is_some(), |v| {
                 let url = self.release_url.clone().unwrap();
                 v.child(
                     Button::new("open-update")
-                        .label("查看 Release")
+                        .ghost()
+                        .label("查看发布版本")
                         .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url))),
                 )
-            })
+            });
+        v_flex()
+            .gap_5()
+            .child(settings_card(identity, cx))
+            .child(links)
+            .child(settings_card(updates, cx))
     }
     pub(super) fn drain_settings(&mut self, cx: &mut Context<Self>) {
         while let Ok(result) = self.settings_rx.try_recv() {

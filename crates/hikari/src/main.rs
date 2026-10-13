@@ -19,6 +19,7 @@ use hikari_runtime::{
     AppConfig, ConfigStore, McpManager, McpServerConfig, McpStatus, McpTransport, MemoryCore,
     MemoryModels, PersonaStore, Session, SessionStore, SkillCatalog,
 };
+use settings_ui::{settings_card, settings_heading, settings_label, settings_row};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::process::Command;
@@ -31,6 +32,7 @@ use std::time::Duration;
 mod chat;
 mod memory_ui;
 mod settings;
+mod settings_ui;
 mod shell;
 mod workspace;
 
@@ -189,6 +191,7 @@ struct Preview {
     searching: bool,
     settings: bool,
     section: Section,
+    settings_open: std::collections::HashSet<String>,
     dark: bool,
     new_memory: bool,
     memory_core: Option<Arc<MemoryCore>>,
@@ -202,6 +205,9 @@ struct Preview {
     memory_units: Vec<hikari_runtime::MemoryUnit>,
     memory_offset: usize,
     memory_source: String,
+    memory_source_id: Option<String>,
+    memory_tab: usize,
+    memory_facts: bool,
     persona_store: PersonaStore,
     persona_editor: Entity<TextareaState>,
     persona_preview: bool,
@@ -440,6 +446,7 @@ impl Preview {
             searching: false,
             settings: false,
             section: Section::Provider,
+            settings_open: Default::default(),
             dark: config.dark,
             new_memory: true,
             memory_core,
@@ -453,6 +460,9 @@ impl Preview {
             memory_units: Vec::new(),
             memory_offset: 0,
             memory_source: String::new(),
+            memory_source_id: None,
+            memory_tab: 0,
+            memory_facts: false,
             persona_store,
             persona_editor,
             persona_preview: false,
@@ -2513,6 +2523,10 @@ impl Preview {
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
                             this.section = section;
+                            this.management_notice.clear();
+                            if section == Section::Memory {
+                                this.refresh_memory(cx);
+                            }
                             cx.notify();
                         }),
                     )
@@ -2528,51 +2542,95 @@ impl Preview {
             Section::Persona => div().child(self.persona_page(cx)),
             Section::Skill => div().child(self.skill_page(cx)),
             Section::Mcp => div().child(self.mcp_page(cx)),
-            Section::Channels => div().child(note(
-                "外部通讯",
-                "Telegram、Discord 以后可以接进来。今天先只在这里说话。",
-                theme.clone(),
-            )),
+            Section::Channels => div().child(
+                v_flex()
+                    .gap_4()
+                    .child(settings_heading("外部通讯"))
+                    .child(settings_card(settings_label("暂未开放", cx), cx)),
+            ),
             Section::About => div().child(self.about_page(cx)),
         };
 
-        div()
-            .id("settings-body")
+        let configurable = matches!(self.section, Section::Provider | Section::Appearance)
+            || (self.section == Section::Memory && self.memory_tab == 1);
+        v_flex()
             .flex_1()
+            .min_w_0()
             .h_full()
-            .overflow_y_scroll()
-            .px(px(48.))
-            .py(px(36.))
+            .min_h_0()
             .child(
                 div()
-                    .max_w(px(760.))
-                    .flex()
-                    .flex_col()
-                    .gap_5()
-                    .child(body)
-                    .child(div().text_xs().child(if self.settings_dirty {
-                        "有未保存的更改"
-                    } else {
-                        "已保存"
-                    }))
-                    .child(
-                        Button::new("save-settings")
-                            .label("保存设置")
-                            .on_click(cx.listener(|this, _, _, cx| this.save_config(cx))),
+                    .id("settings-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px(px(32.))
+                    .py(px(28.))
+                    .child(div().w_full().max_w(px(760.)).child(body)),
+            )
+            .when(
+                configurable || self.settings_dirty || !self.management_notice.is_empty(),
+                |page| {
+                    page.child(
+                        v_flex()
+                            .gap_2()
+                            .px(px(32.))
+                            .py_3()
+                            .border_t_1()
+                            .border_color(theme.border)
+                            .when(configurable || self.settings_dirty, |footer| {
+                                footer.child(
+                                    h_flex()
+                                        .max_w(px(760.))
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_3()
+                                        .child(settings_label(
+                                            if self.settings_dirty {
+                                                "未保存"
+                                            } else {
+                                                "已保存"
+                                            },
+                                            cx,
+                                        ))
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .child(
+                                                    Button::new("discard-settings")
+                                                        .ghost()
+                                                        .label("恢复")
+                                                        .on_click(cx.listener(
+                                                            |this, _, window, cx| {
+                                                                this.discard_settings(window, cx)
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    Button::new("save-settings")
+                                                        .primary()
+                                                        .label("保存设置")
+                                                        .disabled(!self.settings_dirty)
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.save_config(cx)
+                                                        })),
+                                                ),
+                                        ),
+                                )
+                            })
+                            .when(!self.management_notice.is_empty(), |footer| {
+                                footer.child(
+                                    div()
+                                        .id("settings-notice")
+                                        .max_h(px(80.))
+                                        .overflow_y_scroll()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(self.management_notice.clone()),
+                                )
+                            }),
                     )
-                    .child(
-                        Button::new("discard-settings")
-                            .ghost()
-                            .label("恢复已保存设置")
-                            .on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.discard_settings(window, cx)
-                                }),
-                            ),
-                    )
-                    .when(!self.management_notice.is_empty(), |this| {
-                        this.child(div().text_xs().child(self.management_notice.clone()))
-                    }),
+                },
             )
     }
 
@@ -2581,84 +2639,69 @@ impl Preview {
     }
 
     fn appearance_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors.clone();
-        v_flex()
-            .gap_4()
-            .child(page_title(
-                "界面",
-                "亮一点或暗一点，都只是换一层光。",
-                theme.clone(),
-            ))
+        let themes = h_flex()
+            .gap_2()
             .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new("light")
-                            .when(!self.dark, |this| this.primary())
-                            .when(self.dark, |this| this.ghost())
-                            .label("浅色")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.set_dark(false, window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("dark")
-                            .when(self.dark, |this| this.primary())
-                            .when(!self.dark, |this| this.ghost())
-                            .label("深色")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.set_dark(true, window, cx);
-                            })),
-                    ),
+                Button::new("light")
+                    .label("浅色")
+                    .when(!self.dark, |b| b.primary())
+                    .when(self.dark, |b| b.ghost())
+                    .on_click(cx.listener(|this, _, window, cx| this.set_dark(false, window, cx))),
             )
+            .child(
+                Button::new("dark")
+                    .label("深色")
+                    .when(self.dark, |b| b.primary())
+                    .when(!self.dark, |b| b.ghost())
+                    .on_click(cx.listener(|this, _, window, cx| this.set_dark(true, window, cx))),
+            );
+        v_flex()
+            .gap_5()
+            .child(settings_heading("界面"))
+            .child(settings_card(settings_row("主题", themes, cx), cx))
             .child(self.typography_page(cx))
     }
 
     fn skill_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().colors.clone();
-        v_flex()
-            .gap_4()
-            .child(page_title(
-                "Skill",
-                "添加本机的 Skill，让 Hikari 在需要时读取它的指令。",
-                theme.clone(),
-            ))
-            .child(Input::new(&self.skill_path))
-            .child(self.skill_import_page(cx))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new("add-skill-root")
-                            .label("添加目录")
-                            .on_click(cx.listener(|this, _, _, cx| this.add_skill_root(cx))),
-                    )
-                    .child(
-                        Button::new("refresh-skills")
-                            .ghost()
-                            .label("重新扫描")
-                            .on_click(cx.listener(|this, _, _, cx| this.refresh_skills(cx))),
-                    ),
-            )
-            .children(
-                self.config
-                    .skill_roots
-                    .iter()
-                    .enumerate()
-                    .map(|(index, path)| {
-                        v_flex()
-                            .gap_1()
-                            .child(div().text_xs().child(path.display().to_string()))
-                            .child(
-                                Button::new(SharedString::from(format!(
-                                    "remove-skill-root-{index}"
-                                )))
-                                .ghost()
-                                .small()
-                                .label("移除目录")
-                                .when(index == 0, |button| button.label("Hikari 内置目录"))
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
+        let directories =
+            v_flex()
+                .gap_3()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(div().flex_1().min_w_0().child(Input::new(&self.skill_path)))
+                        .child(
+                            Button::new("add-skill-root")
+                                .label("添加")
+                                .on_click(cx.listener(|this, _, _, cx| this.add_skill_root(cx))),
+                        ),
+                )
+                .children(
+                    self.config
+                        .skill_roots
+                        .iter()
+                        .enumerate()
+                        .map(|(index, path)| {
+                            h_flex()
+                                .gap_3()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_xs()
+                                        .child(path.display().to_string()),
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "remove-skill-root-{index}"
+                                    )))
+                                    .ghost()
+                                    .small()
+                                    .label(if index == 0 { "内置" } else { "移除" })
+                                    .disabled(index == 0)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
                                         if index == 0 {
                                             return;
                                         }
@@ -2666,19 +2709,38 @@ impl Preview {
                                         if this.persist_resources(cx) {
                                             this.refresh_skills(cx);
                                         }
-                                    },
-                                )),
-                            )
-                    }),
+                                    })),
+                                )
+                        }),
+                );
+        let mut page = v_flex()
+            .gap_4()
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(settings_heading("Skills"))
+                    .child(
+                        Button::new("refresh-skills")
+                            .ghost()
+                            .small()
+                            .label("刷新")
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh_skills(cx))),
+                    ),
             )
-            .children(self.skills.skills.iter().enumerate().map(|(index, skill)| {
-                let path = skill.path.clone();
+            .child(settings_label(
+                format!("{} 个 Skill", self.skills.skills.len()),
+                cx,
+            ));
+        for (index, skill) in self.skills.skills.iter().enumerate() {
+            let path = skill.path.clone();
+            let details = v_flex()
+                .gap_2()
+                .child(div().text_sm().child(skill.description.clone()))
+                .child(settings_label(skill.path.display().to_string(), cx));
+            page = page.child(settings_card(
                 v_flex()
-                    .gap_1()
-                    .p_3()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(theme.border)
+                    .gap_3()
                     .child(
                         Switch::new(SharedString::from(format!("skill-{index}")))
                             .label(skill.name.clone())
@@ -2687,28 +2749,48 @@ impl Preview {
                                 this.toggle_skill(path.clone(), *value, cx)
                             })),
                     )
-                    .child(div().text_sm().child(skill.description.clone()))
-                    .child(div().text_xs().child(skill.path.display().to_string()))
-            }))
-            .when(self.skills.skills.is_empty(), |this| {
-                this.child(
-                    div()
-                        .text_sm()
-                        .child("还没有 Skill。目录里需要包含 SKILL.md。"),
-                )
-            })
+                    .child(self.settings_fold(
+                        format!("skill-detail-{index}"),
+                        "详情",
+                        details,
+                        cx,
+                    )),
+                cx,
+            ));
+        }
+        page.when(self.skills.skills.is_empty(), |page| {
+            page.child(settings_card(settings_label("暂无 Skill", cx), cx))
+        })
+        .child(self.settings_fold("skill-directories", "资源目录", directories, cx))
+        .child(self.settings_fold(
+            "skill-import",
+            "导入 Skills",
+            self.skill_import_page(cx),
+            cx,
+        ))
+        .when(!self.skills.diagnostics.is_empty(), |page| {
+            page.child(
+                self.settings_fold(
+                    "skill-diagnostics",
+                    "扫描诊断",
+                    v_flex()
+                        .gap_2()
+                        .children(self.skills.diagnostics.iter().map(|s| {
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(s.clone())
+                        })),
+                    cx,
+                ),
+            )
+        })
     }
 
     fn mcp_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().colors.clone();
-        v_flex()
-            .gap_4()
-            .child(page_title(
-                "MCP",
-                "连接本机或远程工具服务。连接成功后，Hikari 就可以调用它们。",
-                theme.clone(),
-            ))
-            .child(self.mcp_import_page(cx))
+        let form = v_flex()
+            .gap_3()
             .child(
                 h_flex()
                     .gap_2()
@@ -2752,7 +2834,9 @@ impl Preview {
                 Button::new("add-mcp")
                     .label("添加并连接")
                     .on_click(cx.listener(|this, _, window, cx| this.add_mcp(window, cx))),
-            )
+            );
+        let servers = v_flex()
+            .gap_3()
             .children(
                 self.config
                     .mcp_servers
@@ -2785,7 +2869,7 @@ impl Preview {
                             .border_color(theme.border)
                             .child(
                                 Switch::new(SharedString::from(format!("mcp-enabled-{index}")))
-                                    .label(format!("{name} · {label}"))
+                                    .label(name.clone())
                                     .checked(server.enabled)
                                     .on_change(cx.listener(move |this, value, window, cx| {
                                         this.config.mcp_servers[index].enabled = *value;
@@ -2795,7 +2879,29 @@ impl Preview {
                                         this.sync_mcp_editor(window, cx);
                                     })),
                             )
-                            .child(div().text_xs().child(detail))
+                            .child(settings_label(
+                                format!(
+                                    "{label} · {} 个工具",
+                                    status.map(|s| s.tools.len()).unwrap_or(0)
+                                ),
+                                cx,
+                            ))
+                            .child(self.settings_fold(
+                                format!("mcp-details-{name}"),
+                                "工具与连接详情",
+                                v_flex().gap_2().child(div().text_xs().child(detail)).child(
+                                    settings_label(
+                                        match &server.transport {
+                                            McpTransport::Stdio { command, args, .. } => {
+                                                format!("{command} {}", args.join(" "))
+                                            }
+                                            McpTransport::StreamableHttp { url, .. } => url.clone(),
+                                        },
+                                        cx,
+                                    ),
+                                ),
+                                cx,
+                            ))
                             .child(
                                 h_flex()
                                     .gap_2()
@@ -2878,14 +2984,34 @@ impl Preview {
                                     ),
                             )
                     }),
-            )
-            .child(div().text_sm().child("高级配置：修改环境变量、认证或超时"))
-            .child(Textarea::new(&self.mcp_config).h(px(220.)))
+            );
+        let advanced = v_flex()
+            .gap_3()
+            .child(Textarea::new(&self.mcp_config).h(px(260.)))
             .child(
                 Button::new("apply-mcp-json")
-                    .label("应用配置并连接")
+                    .label("应用并连接")
                     .on_click(cx.listener(|this, _, _, cx| this.apply_mcp_config(cx))),
-            )
+            );
+        v_flex()
+            .gap_4()
+            .child(settings_heading("MCP"))
+            .child(settings_label(
+                format!("{} 个服务", self.config.mcp_servers.len()),
+                cx,
+            ))
+            .child(servers)
+            .when(self.config.mcp_servers.is_empty(), |page| {
+                page.child(settings_card(settings_label("暂无服务", cx), cx))
+            })
+            .child(self.settings_fold("mcp-add", "添加服务", form, cx))
+            .child(self.settings_fold(
+                "mcp-import",
+                "从其他客户端导入",
+                self.mcp_import_page(cx),
+                cx,
+            ))
+            .child(self.settings_fold("mcp-advanced", "高级配置 · JSON", advanced, cx))
     }
 }
 
@@ -2935,18 +3061,6 @@ fn talk_row(
         )
 }
 
-fn page_title(title: &'static str, hint: &'static str, theme: ThemeColor) -> impl IntoElement {
-    v_flex()
-        .gap_1()
-        .child(div().text_xl().font_weight(FontWeight::MEDIUM).child(title))
-        .child(
-            div()
-                .text_sm()
-                .text_color(theme.muted_foreground)
-                .child(hint),
-        )
-}
-
 fn field(label: &'static str, input: impl IntoElement, theme: ThemeColor) -> impl IntoElement {
     v_flex()
         .gap_1()
@@ -2957,10 +3071,6 @@ fn field(label: &'static str, input: impl IntoElement, theme: ThemeColor) -> imp
                 .child(label),
         )
         .child(input)
-}
-
-fn note(title: &'static str, hint: &'static str, theme: ThemeColor) -> impl IntoElement {
-    page_title(title, hint, theme)
 }
 
 fn main() {

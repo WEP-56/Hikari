@@ -10,6 +10,7 @@ pub mod updates;
 pub mod workspace;
 
 pub use config::{AppConfig, ConfigStore};
+pub use hikari_memory::BrowseView as MemoryBrowseView;
 pub use hikari_memory::Core as MemoryCore;
 pub use hikari_memory::Unit as MemoryUnit;
 pub use mcp::{McpManager, McpServerConfig, McpStatus, McpTransport};

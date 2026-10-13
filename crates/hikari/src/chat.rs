@@ -789,4 +789,4 @@ fn copy_button(id: String, text: SharedString, ink: Ink) -> Button {
 
 #[cfg(test)]
 #[path = "chat_tests.rs"]
-mod tests;
+pub(super) mod tests;

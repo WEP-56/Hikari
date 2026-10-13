@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-更新于 2026-10-13。第一阶段已完成基础 agent、设置和桌面会话交互，本轮已完成 Hindsight 风格 Memory Core、全局角色卡和桌面设置接入，进入真实模型与 GPUI 手工验收阶段。
+更新于 2026-10-13。第一阶段已完成基础 agent、设置和桌面会话交互，已完成 Hindsight 风格 Memory Core、全局角色卡、桌面设置接入及设置页分组整理，进入真实模型与 GPUI 手工验收阶段。
 
 已完成：
 
@@ -17,10 +17,12 @@
 - Skill 支持本地目录发现、YAML frontmatter、启停、按需加载指令和受目录限制的资源读取。
 - 前端已经有会话列表、聊天、运行中任务控制、提供商设置、MCP 管理、Skill 管理和主题设置。
 - 设置现已支持多个提供商及独立模型元数据、请求头、接口兼容项、思考挡位、token 限制、请求超时和工具轮数；聊天菜单使用已保存模型列表。
-- 界面设置支持正文、代码与终端独立字体/字号、界面字号和正文行高，提供预览与恢复已保存设置。
+- 界面设置支持正文、代码与终端独立字体/字号、界面字号和正文行高；字体使用已安装字体的可搜索下拉框，保留手动输入兜底，提供预览与恢复已保存设置。
 - Skill 支持扫描 Codex、Claude、Hermes 和通用 Agents 的用户/项目资源目录，勾选复制完整资源到 `.hikari/skills`，也可直接挂载目录。
 - MCP 支持从 Claude JSON、Codex TOML、Hermes YAML 扫描导入，显示来源与诊断，支持勾选和同名覆盖；导入服务默认停用。
 - 关于页提供 GitHub 仓库、Issues、Releases 跳转及正式 Release tag 的版本比较。
+- 设置页采用统一卡片、字段行与折叠区：记忆按「记忆库 / 设置 / 任务」分栏，人格按「编辑 / 预览」分栏，MCP/Skill 先展示现有资源，添加、导入和高级配置按需展开；保存/恢复固定在底部。见 [settings-ui.md](settings-ui.md)。
+- 记忆库默认只展示 observation 与没有存续 observation 覆盖的事实；「原始事实」保留 world/experience 证据，来源原文在对应卡片内展开。浏览过滤在搜索和分页前执行，agent 的检索策略不变。
 - 会话保存完整 transcript，同时保存当前 provider context、usage 和 `retained_until`。
 - 助手正文支持 GFM Markdown；每轮最终回答单独保留，执行过程完成后默认收起，思考和工具详情可独立展开。工具参数与输出可从历史恢复，失败状态清晰可见，长代码与输出内部滚动。
 - 已压缩内容间距；输入框从 1 行向上扩展到 6 行，超过后内部滚动，清空后恢复紧凑高度。
@@ -43,7 +45,7 @@ cargo test -p hikari chat_ui_interactions -- --ignored --nocapture
 git diff --check
 ```
 
-本轮共通过 72 项自动测试，另单独通过 1 项真实 GPUI 交互测试。GPUI 测试使用隔离的 `target/chat-test-data`，覆盖深浅色主题、Markdown、折叠、输入框扩展/滚动、工作区隔离、终端切换、草稿、会话管理、密钥保存恢复，以及记忆设置/管理、角色卡编辑与预览。Windows GPUI 后端不支持 `render_to_image`，未生成像素截图。测试使用本地 HTTP / stdio fixture，不调用付费模型；真实模型网关和实际 MCP 服务仍需验收。聊天展示细节见 [chat-ui.md](chat-ui.md)。
+本轮共通过 73 项自动测试，另单独通过 1 项 GPUI 事件交互测试。GPUI 测试使用隔离的 `target/chat-test-data`，覆盖深浅色主题、Markdown、折叠、输入框扩展/滚动、工作区隔离、终端切换、草稿、会话管理、密钥保存恢复，以及记忆设置/管理、角色卡编辑与预览、界面/MCP/Skill 设置折叠展开与收起。Windows GPUI 后端不支持 `render_to_image`，未生成像素截图；真实界面效果与手动交互由用户验收。测试使用本地 HTTP / stdio fixture，不调用付费模型；真实模型网关和实际 MCP 服务仍需验收。聊天展示细节见 [chat-ui.md](chat-ui.md)。
 
 ## 目录速览
 

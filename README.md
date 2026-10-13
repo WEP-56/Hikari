@@ -99,6 +99,6 @@ API keys are saved in plaintext in the local configuration, or read from environ
 
 ### Built on
 
-Memory design inspired by [Hindsight](https://github.com/vectorize-io/hindsight). Agent core adapted from [Pi](https://github.com/Dicklesworthstone/pi_agent_rust1).
+Memory design inspired by [Hindsight](https://github.com/vectorize-io/hindsight). Agent core adapted from [Pi](https://github.com/Dicklesworthstone/pi_agent_rust).
 
 MIT. Adapted Pi code retains its [upstream license](licenses/pi_agent_rust.LICENSE), including the original rider terms.
