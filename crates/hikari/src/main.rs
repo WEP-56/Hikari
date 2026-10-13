@@ -1,20 +1,20 @@
 use gpui_kit::component::{
-    bubble::{Bubble, BubbleVariant},
     button::{Button, ButtonVariants as _},
     h_flex,
     hover_card::HoverCard,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
-    menu::{DropdownMenu as _, PopupMenuItem},
-    message::{Message, MessageAlignment, MessageContent},
+    menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
+    scroll::ScrollableElement as _,
     switch::Switch,
-    v_flex, ActiveTheme as _, Icon, IconName, Sizable as _, Theme, ThemeColor, ThemeMode, TitleBar,
+    v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+    Theme, ThemeColor, ThemeMode, TitleBar,
 };
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::*;
 use hikari_agent::{
-    companion_prompt, run_turn_with_control, AgentEvent, ApiProtocol, ConsolidateState,
-    Message as AgentMessage, NullMemory, ProtocolProvider, RetainState, ToolRegistry, TurnControl,
-    TurnHost, TurnRequest, Usage, DEFAULT_CONTEXT_TOKENS,
+    companion_prompt, run_turn_with_control, AgentEvent, ConsolidateState, Message as AgentMessage,
+    NullMemory, ProtocolProvider, RetainState, ToolRegistry, TurnControl, TurnHost, TurnRequest,
+    Usage,
 };
 use hikari_runtime::{
     AppConfig, ConfigStore, McpManager, McpServerConfig, McpStatus, McpTransport, Session,
@@ -29,7 +29,10 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
+mod chat;
+mod settings;
 mod shell;
+mod workspace;
 
 enum LineBody {
     User(SharedString),
@@ -41,6 +44,7 @@ enum LineBody {
     Tool {
         id: String,
         name: SharedString,
+        args: SharedString,
         detail: SharedString,
         running: bool,
         error: bool,
@@ -59,6 +63,7 @@ impl Line {
         }
     }
 
+    #[cfg(test)]
     fn assistant(text: impl Into<SharedString>) -> Self {
         Self {
             body: LineBody::Assistant {
@@ -72,7 +77,7 @@ impl Line {
     fn pending() -> Self {
         Self {
             body: LineBody::Assistant {
-                text: "…".into(),
+                text: "".into(),
                 thinking: SharedString::new(""),
                 live: true,
             },
@@ -93,6 +98,8 @@ impl Line {
 struct Talk {
     id: u64,
     title: SharedString,
+    workspace: Option<PathBuf>,
+    pinned: bool,
     preview: SharedString,
     when: SharedString,
     lines: Vec<Line>,
@@ -100,6 +107,7 @@ struct Talk {
     retained_until: usize,
     transcript: Vec<AgentMessage>,
     usage: Usage,
+    view: chat::ChatState,
 }
 
 struct Incoming {
@@ -155,6 +163,11 @@ impl Section {
 struct Preview {
     talks: Vec<Talk>,
     active: Option<usize>,
+    new_workspace: Option<PathBuf>,
+    workspace_store: hikari_runtime::workspace::WorkspaceStore,
+    recent_workspaces: Vec<PathBuf>,
+    workspace_notice: String,
+    workspace_picker_generation: u64,
     sidebar: bool,
     sidebar_width: f32,
     resizing: bool,
@@ -183,6 +196,7 @@ struct Preview {
     terminal_focus: FocusHandle,
     terminal_pump: Option<Task<()>>,
     draft: Entity<TextareaState>,
+    conversation_drafts: std::collections::HashMap<Option<u64>, String>,
     search: Entity<InputState>,
     provider: Entity<InputState>,
     model: Entity<InputState>,
@@ -205,12 +219,38 @@ struct Preview {
     mcp_target: Entity<InputState>,
     mcp_args: Entity<InputState>,
     mcp_http: bool,
+    settings_draft: settings::SettingsDraft,
+    saved_config: AppConfig,
+    settings_dirty: bool,
+    settings_tx: Sender<settings::SettingsResult>,
+    settings_rx: Receiver<settings::SettingsResult>,
+    model_fetching: bool,
+    update_checking: bool,
+    update_notice: String,
+    release_url: Option<String>,
+    external_mcp: hikari_runtime::imports::McpScan,
+    mcp_selected: Vec<bool>,
+    import_overwrite: bool,
+    external_skills: SkillCatalog,
+    skill_selected: Vec<bool>,
+    provider_focus: Option<String>,
+    model_focus: Option<usize>,
+    advanced_open: bool,
+    picker: settings::PickerView,
+    effort_drag: Option<usize>,
+    model_query: Entity<InputState>,
 }
 
 impl Preview {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let config_store = ConfigStore::new(workspace_dir().join(".hikari"));
-        let session_store = SessionStore::new(workspace_dir().join(".hikari"));
+        Self::new_in(workspace_dir().join(".hikari"), window, cx)
+    }
+
+    fn new_in(data_dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let config_store = ConfigStore::new(&data_dir);
+        let session_store = SessionStore::new(&data_dir);
+        let workspace_store = hikari_runtime::workspace::WorkspaceStore::new(&data_dir);
+        let recent_workspaces = workspace_store.load().unwrap_or_default();
         let mut management_notice = String::new();
         let config = config_store.load().unwrap_or_else(|e| {
             management_notice = e.message;
@@ -221,6 +261,12 @@ impl Preview {
             &config.skill_roots,
             &config.disabled_skills,
         );
+        if let Err(e) = std::fs::create_dir_all(data_dir.join("skills")) {
+            management_notice = format!("无法创建 Hikari Skills 目录：{e}");
+        }
+        let settings_draft = settings::SettingsDraft::new(&config, window, cx);
+        let saved_config = config.clone();
+        let (settings_tx, settings_rx) = mpsc::channel();
         let draft = cx.new(|cx| {
             let mut state = TextareaState::new(window, cx)
                 .placeholder("想说的话，放在这里")
@@ -229,13 +275,28 @@ impl Preview {
             state
         });
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("找一段过去的对话"));
-        let provider = cx
-            .new(|cx| InputState::new(window, cx).default_value(config.provider.base_url.clone()));
-        let model =
-            cx.new(|cx| InputState::new(window, cx).default_value(config.provider.model.clone()));
+        let model_query = cx.new(|cx| InputState::new(window, cx).placeholder("搜索模型"));
+        let provider = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(config.provider.base_url.clone())
+                .placeholder("https://api.openai.com/v1")
+        });
+        let model = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(config.provider.model.clone())
+                .placeholder("例如 gpt-4.1")
+        });
         let key = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("本次运行使用的密钥")
+                .placeholder("留空时使用环境变量")
+                .default_value(
+                    config
+                        .providers
+                        .iter()
+                        .find(|p| p.id == config.active_provider)
+                        .map(|p| p.api_key.clone())
+                        .unwrap_or_default(),
+                )
                 .masked(true)
         });
         let key_env = cx.new(|cx| {
@@ -268,6 +329,11 @@ impl Preview {
                 this.send(window, cx);
             }
         });
+        let model_query_sub = cx.subscribe_in(&model_query, window, |_, _, event, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
 
         let (event_tx, event_rx) = mpsc::channel();
         let sessions = session_store.load().unwrap_or_else(|e| {
@@ -288,15 +354,20 @@ impl Preview {
             cx,
         );
 
-        Self {
+        let mut this = Self {
             talks,
             active: None,
+            new_workspace: None,
+            workspace_store,
+            recent_workspaces,
+            workspace_notice: String::new(),
+            workspace_picker_generation: 0,
             sidebar: true,
             sidebar_width: 292.,
             resizing: false,
             resize_origin: 0.,
             resize_start: 292.,
-            thinking: 3,
+            thinking: settings::effort_index(config.provider.reasoning_effort.as_deref()),
             next_talk_id,
             turn_gen: 0,
             busy: false,
@@ -319,13 +390,14 @@ impl Preview {
             terminal_focus: cx.focus_handle(),
             terminal_pump: None,
             draft,
+            conversation_drafts: Default::default(),
             search,
             provider,
             model,
             key,
             key_env,
             call_name,
-            _subscriptions: vec![search_sub, draft_sub],
+            _subscriptions: vec![search_sub, draft_sub, model_query_sub],
             config,
             config_store,
             session_store,
@@ -341,7 +413,30 @@ impl Preview {
             mcp_target,
             mcp_args,
             mcp_http: false,
-        }
+            settings_draft,
+            saved_config,
+            settings_dirty: false,
+            settings_tx,
+            settings_rx,
+            model_fetching: false,
+            update_checking: false,
+            update_notice: String::new(),
+            release_url: None,
+            external_mcp: Default::default(),
+            mcp_selected: Vec::new(),
+            import_overwrite: false,
+            external_skills: Default::default(),
+            skill_selected: Vec::new(),
+            provider_focus: None,
+            model_focus: None,
+            advanced_open: false,
+            picker: settings::PickerView::Closed,
+            effort_drag: None,
+            model_query,
+        };
+        this.apply_typography(cx);
+        this.observe_settings(window, cx);
+        this
     }
 
     fn set_dark(&mut self, dark: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -355,6 +450,8 @@ impl Preview {
             Some(window),
             cx,
         );
+        self.apply_typography(cx);
+        self.settings_dirty = true;
         cx.notify();
     }
 
@@ -367,9 +464,16 @@ impl Preview {
         if text.is_empty() {
             return;
         }
+        let cwd = self.agent_directory();
+        if let Err(error) = self.prepare_agent_directory() {
+            self.workspace_notice = error;
+            cx.notify();
+            return;
+        }
         let idx = match self.active {
             Some(idx) => idx,
             None => {
+                self.conversation_drafts.remove(&None);
                 let id = self.next_talk_id;
                 self.next_talk_id += 1;
                 self.talks.insert(
@@ -377,6 +481,8 @@ impl Preview {
                     Talk {
                         id,
                         title: title_from(&text),
+                        workspace: self.new_workspace.clone(),
+                        pinned: false,
                         preview: text.clone().into(),
                         when: "现在".into(),
                         lines: Vec::new(),
@@ -384,6 +490,7 @@ impl Preview {
                         retained_until: 0,
                         transcript: Vec::new(),
                         usage: Usage::default(),
+                        view: chat::ChatState::default(),
                     },
                 );
                 self.active = Some(0);
@@ -391,11 +498,14 @@ impl Preview {
             }
         };
         let talk_id = self.talks[idx].id;
+        self.conversation_drafts.remove(&Some(talk_id));
         self.talks[idx].preview = text.clone().into();
         if self.talks[idx].lines.is_empty() {
             self.talks[idx].title = title_from(&text);
         }
         self.talks[idx].lines.push(Line::user(&text));
+        let start = self.talks[idx].lines.len() - 1;
+        self.talks[idx].view.start(start);
         self.talks[idx].lines.push(Line::pending());
         self.talks[idx].messages.push(AgentMessage::user(&text));
         self.talks[idx].transcript.push(AgentMessage::user(&text));
@@ -404,16 +514,16 @@ impl Preview {
             state.set_value("", window, cx);
         });
 
-        self.sync_provider_config(cx);
-        let provider_config = self.config.provider.clone();
-        let key = self.key.read(cx).value().to_string();
+        let provider_config = self.saved_config.provider.clone();
+        let key = self.saved_provider_key(cx);
         let key = if key.trim().is_empty() {
             std::env::var(&provider_config.api_key_env).unwrap_or_default()
         } else {
             key
         };
-        let name = self.call_name.read(cx).value().to_string();
-        let thinking = THINKING[self.thinking];
+        let name = self.saved_config.persona_name.clone();
+        let thinking =
+            THINKING[settings::effort_index(provider_config.reasoning_effort.as_deref())];
         let messages = self.talks[idx].messages.clone();
         let retained_until = self.talks[idx].retained_until;
         // 记忆核心还没接上。开关先留着，loop 里的 recall / retain 缝已经在。
@@ -433,17 +543,21 @@ impl Preview {
         let abort = Arc::new(AtomicBool::new(false));
         self.abort = Some(abort.clone());
         self.busy = true;
+        self.workspace_picker_generation += 1;
         self.running_talk = Some(talk_id);
         self.turn_control = Arc::new(TurnControl::default());
         let turn_control = self.turn_control.clone();
         self.start_pump(cx);
         let tx = self.event_tx.clone();
-        let cwd = workspace_dir();
         let skills = self.skills.clone();
         let mcp = self.mcp.clone();
-        let mcp_configs = self.config.mcp_servers.clone();
+        let mcp_configs = self.saved_config.mcp_servers.clone();
         let runtime_tx = self.runtime_tx.clone();
-        let max_tool_rounds = self.config.max_tool_rounds;
+        let max_tool_rounds = self.saved_config.max_tool_rounds;
+        let directory_prompt = format!(
+            "\n当前会话的工作目录：{}。相对文件路径与命令都以此目录为基准。",
+            cwd.display()
+        );
         thread::spawn(move || {
             mcp.reconcile(&mcp_configs, &cwd);
             let _ = runtime_tx.send(RuntimeUpdate {
@@ -465,7 +579,12 @@ impl Preview {
                 messages,
                 retained_until,
                 query: text.clone(),
-                system_prompt: format!("{}{}", companion_prompt(&name, thinking), skills.prompt()),
+                system_prompt: format!(
+                    "{}{}{}",
+                    companion_prompt(&name, thinking),
+                    skills.prompt(),
+                    directory_prompt
+                ),
                 context_limit_tokens: provider_config.context_tokens,
                 max_tool_rounds,
             };
@@ -520,6 +639,7 @@ impl Preview {
     }
 
     fn drain_events(&mut self, cx: &mut Context<Self>) {
+        self.drain_settings(cx);
         while let Ok(update) = self.runtime_rx.try_recv() {
             self.mcp_statuses = update.statuses;
             cx.notify();
@@ -541,6 +661,7 @@ impl Preview {
         let Some(idx) = self.talks.iter().position(|talk| talk.id == talk_id) else {
             return;
         };
+        let follow = self.talks[idx].view.near_bottom();
         match event {
             AgentEvent::InputDelivered { text } => {
                 self.talks[idx].lines.push(Line::user(text.clone()));
@@ -569,15 +690,25 @@ impl Preview {
             AgentEvent::MessageEnd { message } => {
                 self.talks[idx].transcript.push(message.clone());
                 if let Some(pos) = self.talks[idx].lines.iter().rposition(Line::is_live) {
-                    let empty = message.text().is_empty();
+                    let empty = matches!(&message, AgentMessage::Assistant { text, thinking, .. }
+                        if text.is_empty() && thinking.is_empty());
                     if empty {
                         self.talks[idx].lines.remove(pos);
-                    } else if let LineBody::Assistant { live, text, .. } =
-                        &mut self.talks[idx].lines[pos].body
+                    } else if let LineBody::Assistant {
+                        live,
+                        text,
+                        thinking,
+                    } = &mut self.talks[idx].lines[pos].body
                     {
                         *live = false;
-                        if text.is_empty() || text.as_ref() == "…" {
-                            *text = message.text().to_string().into();
+                        if let AgentMessage::Assistant {
+                            text: final_text,
+                            thinking: final_thinking,
+                            ..
+                        } = &message
+                        {
+                            *text = final_text.clone().into();
+                            *thinking = final_thinking.clone().into();
                         }
                     }
                 }
@@ -592,7 +723,8 @@ impl Preview {
                     body: LineBody::Tool {
                         id: tool_call_id,
                         name: tool_name.into(),
-                        detail: args.into(),
+                        args: args.into(),
+                        detail: "".into(),
                         running: true,
                         error: false,
                     },
@@ -693,8 +825,32 @@ impl Preview {
                         )));
                     }
                 }
+                for line in &mut self.talks[idx].lines {
+                    if let LineBody::Tool {
+                        running,
+                        error: failed,
+                        detail,
+                        ..
+                    } = &mut line.body
+                    {
+                        if *running {
+                            *running = false;
+                            *failed = true;
+                            if detail.is_empty() {
+                                *detail = error
+                                    .as_deref()
+                                    .unwrap_or("任务结束，未收到工具结果。")
+                                    .to_string()
+                                    .into();
+                            }
+                        }
+                    }
+                }
                 self.save_sessions();
             }
+        }
+        if follow {
+            self.talks[idx].view.scroll.scroll_to_bottom();
         }
         cx.notify();
     }
@@ -723,6 +879,7 @@ impl Preview {
     }
 
     fn finish_pending(&mut self, idx: usize, error: &str) {
+        self.talks[idx].view.finish();
         if let Some(pos) = self.talks[idx].lines.iter().rposition(Line::is_live) {
             if let LineBody::Assistant { text, live, .. } = &mut self.talks[idx].lines[pos].body {
                 *live = false;
@@ -759,18 +916,31 @@ impl Preview {
 }
 
 fn talk_from_session(session: Session) -> Talk {
+    let arguments: std::collections::HashMap<_, _> = session
+        .transcript
+        .iter()
+        .flat_map(|message| match message {
+            AgentMessage::Assistant { tool_calls, .. } => tool_calls.as_slice(),
+            _ => &[],
+        })
+        .map(|call| (call.id.as_str(), call.arguments.as_str()))
+        .collect();
     let lines = session
         .transcript
         .iter()
         .filter_map(|message| match message {
             AgentMessage::User { text } => Some(Line::user(text.clone())),
-            AgentMessage::Assistant { text, thinking, .. } => Some(Line {
-                body: LineBody::Assistant {
-                    text: text.clone().into(),
-                    thinking: thinking.clone().into(),
-                    live: false,
-                },
-            }),
+            AgentMessage::Assistant { text, thinking, .. }
+                if !text.is_empty() || !thinking.is_empty() =>
+            {
+                Some(Line {
+                    body: LineBody::Assistant {
+                        text: text.clone().into(),
+                        thinking: thinking.clone().into(),
+                        live: false,
+                    },
+                })
+            }
             AgentMessage::ToolResult {
                 tool_call_id,
                 name,
@@ -780,12 +950,18 @@ fn talk_from_session(session: Session) -> Talk {
                 body: LineBody::Tool {
                     id: tool_call_id.clone(),
                     name: name.clone().into(),
+                    args: arguments
+                        .get(tool_call_id.as_str())
+                        .copied()
+                        .unwrap_or_default()
+                        .to_string()
+                        .into(),
                     detail: text.clone().into(),
                     running: false,
                     error: *is_error,
                 },
             }),
-            AgentMessage::ContextSummary { .. } => None,
+            AgentMessage::ContextSummary { .. } | AgentMessage::Assistant { .. } => None,
         })
         .collect();
     let preview = session
@@ -798,6 +974,8 @@ fn talk_from_session(session: Session) -> Talk {
     Talk {
         id: session.id,
         title: session.title.into(),
+        workspace: session.workspace,
+        pinned: session.pinned,
         preview: preview.into(),
         when: "已保存".into(),
         lines,
@@ -805,6 +983,7 @@ fn talk_from_session(session: Session) -> Talk {
         transcript: session.transcript,
         retained_until: session.retained_until,
         usage: session.usage,
+        view: chat::ChatState::default(),
     }
 }
 fn title_from(text: &str) -> SharedString {
@@ -836,7 +1015,8 @@ impl Render for Preview {
             .flex()
             .bg(ink.bg)
             .text_color(ink.fg)
-            .font_family("Segoe UI")
+            .font_family(self.config.appearance.text_font.clone())
+            .text_size(px(self.config.appearance.ui_size))
             .when(self.sidebar && !self.settings, |this| {
                 this.child(self.sidebar(cx))
             })
@@ -883,7 +1063,7 @@ impl Preview {
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let ink = ink(self.dark);
         let query = self.search.read(cx).value().to_lowercase();
-        let rows: Vec<_> = self
+        let mut indices: Vec<_> = self
             .talks
             .iter()
             .enumerate()
@@ -892,7 +1072,20 @@ impl Preview {
                     || talk.title.to_lowercase().contains(&query)
                     || talk.preview.to_lowercase().contains(&query)
             })
-            .map(|(idx, talk)| side_row(idx, talk, self.active == Some(idx), ink, cx))
+            .map(|(idx, _)| idx)
+            .collect();
+        indices.sort_by_key(|&i| !self.talks[i].pinned);
+        let rows: Vec<_> = indices
+            .into_iter()
+            .map(|idx| {
+                side_row(
+                    &self.talks[idx],
+                    self.active == Some(idx),
+                    self.running_talk == Some(self.talks[idx].id),
+                    ink,
+                    cx,
+                )
+            })
             .collect();
 
         let width = self.sidebar_width;
@@ -961,10 +1154,7 @@ impl Preview {
                         "new-chat",
                         IconName::Plus,
                         "新建会话",
-                        cx.listener(|this, _, _, cx| {
-                            this.active = None;
-                            cx.notify();
-                        }),
+                        cx.listener(|this, _, window, cx| this.new_conversation(window, cx)),
                     ))
                     .child(
                         div()
@@ -1063,7 +1253,10 @@ impl Preview {
         if self.shell.is_some() {
             return;
         }
-        match shell::Shell::spawn(&workspace_dir()) {
+        if !self.workspace_available() {
+            return;
+        }
+        match shell::Shell::spawn(&self.agent_directory()) {
             Ok(shell) => {
                 self.shell = Some(shell);
                 self.terminal_error = None;
@@ -1126,7 +1319,11 @@ impl Preview {
                             .border_1()
                             .border_color(ink.line)
                             .text_xs()
-                            .child("本地 1"),
+                            .child(
+                                self.selected_workspace()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_default(),
+                            ),
                     )
                     .child(icon_hit(
                         "term-hide",
@@ -1144,8 +1341,8 @@ impl Preview {
                     .min_h_0()
                     .p_3()
                     .overflow_y_scroll()
-                    .font_family("Consolas")
-                    .text_xs()
+                    .font_family(self.config.appearance.terminal_font.clone())
+                    .text_size(px(self.config.appearance.terminal_size))
                     .track_focus(&self.terminal_focus)
                     .on_mouse_down(
                         MouseButton::Left,
@@ -1164,25 +1361,47 @@ impl Preview {
             )
     }
 
-    fn open_menu(&self) -> impl IntoElement {
+    fn open_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity().downgrade();
+        let disabled = !self.workspace_available();
         Button::new("open-external")
             .ghost()
             .small()
             .icon(IconName::FolderOpen)
-            .dropdown_menu_with_anchor(Anchor::TopRight, |menu, _, _| {
+            .disabled(disabled)
+            .tooltip(if disabled {
+                "选择工作区后可外部打开"
+            } else {
+                "外部打开工作区"
+            })
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                let explorer = view.clone();
+                let code = view.clone();
+                let bash = view.clone();
                 menu.item(
-                    PopupMenuItem::new("文件资源管理器（默认）")
+                    PopupMenuItem::new("文件资源管理器")
                         .icon(IconName::Folder)
-                        .on_click(|_, _, _| {
-                            let _ = open_workspace(OpenTarget::Explorer);
+                        .disabled(disabled)
+                        .on_click(move |_, _, cx| {
+                            let _ = explorer.update(cx, |this, cx| {
+                                this.open_external(OpenTarget::Explorer, cx)
+                            });
                         }),
                 )
-                .item(PopupMenuItem::new("VS Code").on_click(|_, _, _| {
-                    let _ = open_workspace(OpenTarget::Code);
-                }))
-                .item(PopupMenuItem::new("Git Bash").on_click(|_, _, _| {
-                    let _ = open_workspace(OpenTarget::Bash);
-                }))
+                .item(
+                    PopupMenuItem::new("VS Code")
+                        .disabled(disabled)
+                        .on_click(move |_, _, cx| {
+                            let _ = code
+                                .update(cx, |this, cx| this.open_external(OpenTarget::Code, cx));
+                        }),
+                )
+                .item(PopupMenuItem::new("Git Bash").disabled(disabled).on_click(
+                    move |_, _, cx| {
+                        let _ =
+                            bash.update(cx, |this, cx| this.open_external(OpenTarget::Bash, cx));
+                    },
+                ))
             })
     }
 
@@ -1203,6 +1422,7 @@ impl Preview {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
+                        this.stash_visible_key(cx);
                         this.settings = false;
                         cx.notify();
                     }),
@@ -1228,6 +1448,16 @@ impl Preview {
             .items_center()
             .pl_2()
             .child(lead)
+            .when(self.selected_workspace().is_some(), |this| {
+                this.child(
+                    div()
+                        .max_w(px(240.))
+                        .truncate()
+                        .text_xs()
+                        .text_color(ink(self.dark).muted)
+                        .child(self.selected_workspace().unwrap().display().to_string()),
+                )
+            })
             .child(
                 div()
                     .id("main-drag")
@@ -1235,20 +1465,21 @@ impl Preview {
                     .h_full()
                     .window_control_area(WindowControlArea::Drag),
             )
-            .child(caption_tool(
-                "term",
-                IconName::SquareTerminal,
-                self.terminal_open,
-                cx.listener(|this, _, window, cx| {
-                    this.terminal_open = !this.terminal_open;
-                    if this.terminal_open {
-                        this.ensure_shell(cx);
-                        window.focus(&this.terminal_focus, cx);
-                    }
-                    cx.notify();
-                }),
-            ))
-            .child(self.open_menu())
+            .child(
+                Button::new("term")
+                    .ghost()
+                    .small()
+                    .icon(IconName::SquareTerminal)
+                    .selected(self.terminal_open)
+                    .disabled(!self.workspace_available())
+                    .tooltip(if self.workspace_available() {
+                        "打开工作区终端"
+                    } else {
+                        "选择工作区后可打开终端"
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx))),
+            )
+            .child(self.open_menu(cx))
             .child(caption_hit(
                 "win-min",
                 IconName::WindowMinimize,
@@ -1277,22 +1508,28 @@ impl Preview {
             ))
     }
 
-    fn stage(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn stage(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let ink = ink(self.dark);
         let body = if let Some(idx) = self.active {
             div()
-                .id("stage")
+                .id(SharedString::from(format!("stage-{}", self.talks[idx].id)))
                 .size_full()
+                .relative()
                 .overflow_y_scroll()
+                .track_scroll(&self.talks[idx].view.scroll)
+                .vertical_scrollbar(&self.talks[idx].view.scroll)
                 .py_8()
                 .child(
                     v_flex()
                         .w_full()
-                        .max_w(px(720.))
+                        .max_w(px(800.))
                         .mx_auto()
                         .px_6()
-                        .gap_3()
-                        .children(self.talks[idx].lines.iter().map(|line| message(line, ink))),
+                        .gap_8()
+                        .font_family(self.config.appearance.text_font.clone())
+                        .text_size(px(self.config.appearance.text_size))
+                        .line_height(relative(self.config.appearance.line_height))
+                        .children(self.conversation(idx, ink, cx)),
                 )
                 .into_any_element()
         } else {
@@ -1310,163 +1547,134 @@ impl Preview {
                         .font_weight(FontWeight::SEMIBOLD)
                         .child("今天要做点什么？"),
                 )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(self.workspace_selector(cx))
+                        .child(self.workspace_browse(cx)),
+                )
                 .into_any_element()
         };
         div().flex_1().min_h_0().child(body)
     }
 
     fn composer(&self, ink: Ink, cx: &mut Context<Self>) -> impl IntoElement {
-        div().w_full().px_4().pb(px(20.)).flex_shrink_0().child(
-            v_flex()
-                .w_full()
-                .max_w(px(680.))
-                .mx_auto()
-                .rounded_xl()
-                .border_1()
-                .border_color(ink.line)
-                .bg(ink.input)
-                .px_2()
-                .py_1()
-                .gap_1()
-                .child(Textarea::new(&self.draft).appearance(false).h(px(72.)))
-                .child(
-                    h_flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .gap_1()
-                                .child(icon_hit(
-                                    "attach",
-                                    IconName::Plus,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.active = None;
-                                        cx.notify();
-                                    }),
-                                ))
-                                .child(self.run_config(cx)),
-                        )
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .gap_1()
-                                .child(self.context_usage(ink))
-                                .when(self.busy, |this| {
-                                    this.child(
-                                        Button::new("queue-steering")
-                                            .ghost()
-                                            .small()
-                                            .label("插入当前任务")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.queue_input(true, window, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("queue-follow-up")
-                                            .ghost()
-                                            .small()
-                                            .label(format!(
-                                                "排队 · {}",
-                                                self.turn_control.pending()
-                                            ))
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.queue_input(false, window, cx)
-                                            })),
-                                    )
-                                })
-                                .child(
-                                    div()
-                                        .id("send")
-                                        .size(px(28.))
-                                        .rounded_full()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .bg(ink.fg)
-                                        .text_color(ink.bg)
-                                        .cursor_pointer()
-                                        .child(if self.busy {
-                                            Icon::from(gpui_kit::assets::IconName::SquareStop)
+        div()
+            .w_full()
+            .px_4()
+            .pb(px(20.))
+            .flex_shrink_0()
+            .child(
+                v_flex()
+                    .w_full()
+                    .max_w(px(752.))
+                    .mx_auto()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(ink.line)
+                    .bg(ink.input)
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    // TextareaState controls the height: it grows from one row to
+                    // six rows, then keeps the composer size stable and scrolls
+                    // the editor internally.
+                    .child(Textarea::new(&self.draft).appearance(false))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(icon_hit(
+                                        "attach",
+                                        IconName::Plus,
+                                        cx.listener(|this, _, window, cx| {
+                                            this.new_conversation(window, cx)
+                                        }),
+                                    ))
+                                    .child(self.run_config(cx)),
+                            )
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(self.context_usage(ink))
+                                    .when(self.busy, |this| {
+                                        this.child(
+                                            Button::new("queue-steering")
+                                                .ghost()
                                                 .small()
-                                        } else {
-                                            Icon::new(IconName::ArrowUp).small()
-                                        })
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, window, cx| {
-                                                if this.busy {
-                                                    if let Some(abort) = &this.abort {
-                                                        abort.store(true, Ordering::Relaxed);
+                                                .label("插入当前任务")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.queue_input(true, window, cx)
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("queue-follow-up")
+                                                .ghost()
+                                                .small()
+                                                .label(format!(
+                                                    "排队 · {}",
+                                                    self.turn_control.pending()
+                                                ))
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.queue_input(false, window, cx)
+                                                })),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .id("send")
+                                            .size(px(28.))
+                                            .rounded_full()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .bg(ink.fg)
+                                            .text_color(ink.bg)
+                                            .cursor_pointer()
+                                            .child(if self.busy {
+                                                Icon::from(gpui_kit::assets::IconName::SquareStop)
+                                                    .small()
+                                            } else {
+                                                Icon::new(IconName::ArrowUp).small()
+                                            })
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, window, cx| {
+                                                    if this.busy {
+                                                        if let Some(abort) = &this.abort {
+                                                            abort.store(true, Ordering::Relaxed);
+                                                        }
+                                                    } else {
+                                                        this.send(window, cx);
                                                     }
-                                                } else {
-                                                    this.send(window, cx);
-                                                }
-                                            }),
-                                        ),
-                                ),
-                        ),
-                ),
-        )
+                                                }),
+                                            ),
+                                    ),
+                            ),
+                    ),
+            )
+            .when(!self.workspace_notice.is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(ink.muted)
+                        .pt_1()
+                        .child(self.workspace_notice.clone()),
+                )
+            })
     }
 
     fn run_config(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let view = cx.entity().downgrade();
-        let model_name = self.model.read(cx).value().to_string();
-        let thinking = self.thinking;
-        let shown = if model_name.is_empty() {
-            "未设置"
-        } else {
-            model_name.as_str()
-        };
-        let label = format!("{shown} · {}", THINKING[thinking]);
-        Button::new("run-config")
-            .ghost()
-            .small()
-            .label(label)
-            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, window, menu_cx| {
-                let mut menu = menu.item(PopupMenuItem::label("模型"));
-                for name in MODELS {
-                    let view = view.clone();
-                    let picked = name.to_string();
-                    menu = menu.item(
-                        PopupMenuItem::new(name)
-                            .checked(name == model_name)
-                            .on_click(move |_, window, cx| {
-                                let picked = picked.clone();
-                                let _ = view.update(cx, |this, cx| {
-                                    this.model.update(cx, |state, cx| {
-                                        state.set_value(picked.clone(), window, cx);
-                                    });
-                                    cx.notify();
-                                });
-                            }),
-                    );
-                }
-                let view = view.clone();
-                menu.separator()
-                    .submenu("思考", window, menu_cx, move |menu, _, _| {
-                        let mut menu = menu;
-                        for (index, name) in THINKING.into_iter().enumerate() {
-                            let view = view.clone();
-                            menu = menu.item(
-                                PopupMenuItem::new(name)
-                                    .checked(index == thinking)
-                                    .on_click(move |_, _, cx| {
-                                        let _ = view.update(cx, |this, cx| {
-                                            this.thinking = index;
-                                            cx.notify();
-                                        });
-                                    }),
-                            );
-                        }
-                        menu
-                    })
-            })
+        self.model_menu(cx)
     }
 }
 
-const MODELS: [&str; 3] = ["gpt-4.1", "gpt-4o", "claude-sonnet"];
 const THINKING: [&str; 5] = ["关闭", "低", "中", "高", "最高"];
 
 #[derive(Clone, Copy)]
@@ -1506,11 +1714,12 @@ fn ink(dark: bool) -> Ink {
 
 impl Preview {
     fn context_usage(&self, ink: Ink) -> impl IntoElement {
+        let context_tokens = self.saved_config.provider.context_tokens;
         let used = self.usage.total();
         let ratio = if used == 0 {
             0.0
         } else {
-            (used as f32 / DEFAULT_CONTEXT_TOKENS as f32).clamp(0.0, 1.0)
+            (used as f32 / self.saved_config.provider.context_tokens as f32).clamp(0.0, 1.0)
         };
         let percent = (ratio * 100.0).round() as u32;
         let input = self.usage.input;
@@ -1544,7 +1753,7 @@ impl Preview {
                             .child(
                                 div()
                                     .text_color(ink.muted)
-                                    .child(format!("{used} / {DEFAULT_CONTEXT_TOKENS}")),
+                                    .child(format!("{used} / {context_tokens}")),
                             ),
                     )
                     .child(usage_line("输入", input.to_string(), ink))
@@ -1591,14 +1800,32 @@ fn workspace_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn open_workspace(target: OpenTarget) -> std::io::Result<()> {
-    let dir = workspace_dir();
+fn open_workspace(target: OpenTarget, dir: &std::path::Path) -> std::io::Result<()> {
     match target {
         OpenTarget::Explorer => {
             Command::new("explorer").arg(&dir).spawn()?;
         }
         OpenTarget::Code => {
-            Command::new("code").arg(&dir).spawn()?;
+            let code = [
+                std::env::var_os("LOCALAPPDATA")
+                    .map(PathBuf::from)
+                    .map(|p| p.join("Programs/Microsoft VS Code/Code.exe")),
+                std::env::var_os("ProgramFiles")
+                    .map(PathBuf::from)
+                    .map(|p| p.join("Microsoft VS Code/Code.exe")),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|p| p.is_file())
+            .or_else(|| {
+                std::env::var_os("PATH").and_then(|paths| {
+                    std::env::split_paths(&paths)
+                        .flat_map(|p| [p.join("Code.exe"), p.join("../Code.exe")])
+                        .find(|p| p.is_file())
+                })
+            })
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "没有找到 VS Code"))?;
+            Command::new(code).arg(dir).spawn()?;
         }
         OpenTarget::Bash => {
             let bash = [
@@ -1762,14 +1989,17 @@ fn side_action(
 }
 
 fn side_row(
-    idx: usize,
     talk: &Talk,
     selected: bool,
+    running: bool,
     ink: Ink,
     cx: &mut Context<Preview>,
 ) -> impl IntoElement {
+    let id = talk.id;
+    let pinned = talk.pinned;
+    let view = cx.entity().downgrade();
     div()
-        .id(SharedString::from(format!("talk-{idx}")))
+        .id(SharedString::from(format!("talk-{id}")))
         .px_2()
         .py_1()
         .rounded_md()
@@ -1778,40 +2008,71 @@ fn side_row(
         .hover(|this| this.bg(ink.hover))
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                this.active = Some(idx);
-                cx.notify();
-            }),
+            cx.listener(move |this, _, window, cx| this.select_conversation(id, window, cx)),
         )
         .child(
             v_flex()
                 .gap(px(2.))
-                .child(div().text_sm().child(talk.title.clone()))
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .min_w_0()
+                        .when(pinned, |this| {
+                            this.child(div().text_xs().text_color(ink.muted).child("↑"))
+                        })
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_sm()
+                                .child(talk.title.clone()),
+                        ),
+                )
                 .child(
                     div()
                         .text_xs()
                         .text_color(ink.muted)
+                        .truncate()
                         .child(talk.preview.clone()),
                 ),
         )
+        .context_menu(move |menu, _, _| {
+            let rename = view.clone();
+            let pin = view.clone();
+            let delete = view.clone();
+            menu.item(PopupMenuItem::new("重命名").on_click(move |_, window, cx| {
+                let _ = rename.update(cx, |this, cx| this.rename_dialog(id, window, cx));
+            }))
+            .item(
+                PopupMenuItem::new(if pinned { "取消置顶" } else { "置顶" }).on_click(
+                    move |_, _, cx| {
+                        let _ = pin.update(cx, |this, cx| this.toggle_pin(id, cx));
+                    },
+                ),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new(if running {
+                    "删除（会话运行中）"
+                } else {
+                    "删除会话"
+                })
+                .disabled(running)
+                .on_click(move |_, window, cx| {
+                    let _ = delete.update(cx, |this, cx| this.delete_conversation(id, window, cx));
+                }),
+            )
+        })
 }
 
 impl Preview {
-    fn sync_provider_config(&mut self, cx: &mut Context<Self>) {
-        self.config.provider.base_url = self.provider.read(cx).value().trim().to_string();
-        self.config.provider.model = self.model.read(cx).value().trim().to_string();
-        self.config.provider.api_key_env = self.key_env.read(cx).value().trim().to_string();
-        self.config.persona_name = self.call_name.read(cx).value().to_string();
-        self.config.dark = self.dark;
-    }
-
     fn queue_input(&mut self, steering: bool, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.draft.read(cx).value().trim().to_string();
         if text.is_empty() {
             return;
         }
         if self.active.map(|i| self.talks[i].id) != self.running_talk {
-            self.management_notice = "请回到正在进行的会话，或等它完成后再发送".into();
+            self.workspace_notice = "请回到正在进行的会话，或等它完成后再发送".into();
             cx.notify();
             return;
         }
@@ -1822,14 +2083,24 @@ impl Preview {
         }
         self.draft
             .update(cx, |state, cx| state.set_value("", window, cx));
+        self.conversation_drafts.remove(&self.running_talk);
         cx.notify();
     }
     fn save_config(&mut self, cx: &mut Context<Self>) {
-        self.sync_provider_config(cx);
-        self.management_notice = match self.config_store.save(&self.config) {
-            Ok(()) => "设置已保存。输入的密钥仅用于本次运行；重启后从环境变量读取。".into(),
-            Err(e) => e.message,
-        };
+        self.stash_visible_key(cx);
+        match self.read_settings(cx).and_then(|config| {
+            self.config_store.save(&config)?;
+            Ok(config)
+        }) {
+            Ok(config) => {
+                self.config = config.clone();
+                self.saved_config = config;
+                self.settings_dirty = false;
+                self.apply_typography(cx);
+                self.management_notice = "设置已保存，下一轮请求使用已保存配置。".into();
+            }
+            Err(e) => self.management_notice = format!("未保存：{}", e.message),
+        }
         cx.notify();
     }
     fn save_sessions(&mut self) {
@@ -1839,6 +2110,8 @@ impl Preview {
             .map(|talk| Session {
                 id: talk.id,
                 title: talk.title.to_string(),
+                workspace: talk.workspace.clone(),
+                pinned: talk.pinned,
                 transcript: talk.transcript.clone(),
                 context: talk.messages.clone(),
                 retained_until: talk.retained_until,
@@ -1880,8 +2153,9 @@ impl Preview {
                 if !self.config.skill_roots.contains(&path) {
                     self.config.skill_roots.push(path);
                 }
-                self.save_config(cx);
-                self.refresh_skills(cx);
+                if self.persist_resources(cx) {
+                    self.refresh_skills(cx);
+                }
             }
             Err(e) => {
                 self.management_notice = format!("目录无法打开：{e}");
@@ -1894,8 +2168,9 @@ impl Preview {
         if !enabled {
             self.config.disabled_skills.push(path);
         }
-        self.save_config(cx);
-        self.refresh_skills(cx);
+        if self.persist_resources(cx) {
+            self.refresh_skills(cx);
+        }
     }
     fn sync_mcp_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let value = serde_json::to_string_pretty(&self.config.mcp_servers).unwrap_or_default();
@@ -1904,12 +2179,18 @@ impl Preview {
     }
     fn reconnect_mcp(&mut self, cx: &mut Context<Self>) {
         let mcp = self.mcp.clone();
-        let configs = self.config.mcp_servers.clone();
+        let configs = self.saved_config.mcp_servers.clone();
         let tx = self.runtime_tx.clone();
+        let cwd = self.mcp_directory();
+        if let Err(e) = std::fs::create_dir_all(&cwd) {
+            self.management_notice = format!("无法访问 MCP 工作目录：{e}");
+            cx.notify();
+            return;
+        }
         self.start_pump(cx);
         self.management_notice = "正在连接 MCP 服务".into();
         thread::spawn(move || {
-            mcp.reconcile(&configs, &workspace_dir());
+            mcp.reconcile(&configs, &cwd);
             let _ = tx.send(RuntimeUpdate {
                 statuses: mcp.statuses(),
             });
@@ -1932,8 +2213,9 @@ impl Preview {
         match result {
             Ok(servers) => {
                 self.config.mcp_servers = servers;
-                self.save_config(cx);
-                self.reconnect_mcp(cx);
+                if self.persist_resources(cx) {
+                    self.reconnect_mcp(cx);
+                }
             }
             Err(error) => {
                 self.management_notice = error;
@@ -1948,6 +2230,7 @@ impl Preview {
             McpTransport::StreamableHttp {
                 url: target,
                 bearer_token_env: None,
+                headers: Default::default(),
             }
         } else {
             let args = match serde_json::from_str::<Vec<String>>(&self.mcp_args.read(cx).value()) {
@@ -1986,9 +2269,10 @@ impl Preview {
             return;
         }
         self.config.mcp_servers.push(config);
+        if self.persist_resources(cx) {
+            self.reconnect_mcp(cx);
+        }
         self.sync_mcp_editor(window, cx);
-        self.save_config(cx);
-        self.reconnect_mcp(cx);
     }
 
     fn settings_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2048,11 +2332,7 @@ impl Preview {
                 "Telegram、Discord 以后可以接进来。今天先只在这里说话。",
                 theme.clone(),
             )),
-            Section::About => div().child(v_flex().gap_4().child(portrait(px(96.))).child(note(
-                "关于",
-                "Hikari 是一个待在身边的助手。能说话，也能看这台电脑上的文件。密钥留在本机。",
-                theme.clone(),
-            ))),
+            Section::About => div().child(self.about_page(cx)),
         };
 
         div()
@@ -2064,15 +2344,30 @@ impl Preview {
             .py(px(36.))
             .child(
                 div()
-                    .max_w(px(560.))
+                    .max_w(px(760.))
                     .flex()
                     .flex_col()
                     .gap_5()
                     .child(body)
+                    .child(div().text_xs().child(if self.settings_dirty {
+                        "有未保存的更改"
+                    } else {
+                        "已保存"
+                    }))
                     .child(
                         Button::new("save-settings")
                             .label("保存设置")
                             .on_click(cx.listener(|this, _, _, cx| this.save_config(cx))),
+                    )
+                    .child(
+                        Button::new("discard-settings")
+                            .ghost()
+                            .label("恢复已保存设置")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.discard_settings(window, cx)
+                                }),
+                            ),
                     )
                     .when(!self.management_notice.is_empty(), |this| {
                         this.child(div().text_xs().child(self.management_notice.clone()))
@@ -2081,58 +2376,7 @@ impl Preview {
     }
 
     fn provider_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().colors.clone();
-        v_flex()
-            .gap_5()
-            .child(page_title("提供商", "连上一个模型就够了。", theme.clone()))
-            .child(
-                v_flex().gap_2().children(
-                    [
-                        ApiProtocol::ChatCompletions,
-                        ApiProtocol::Responses,
-                        ApiProtocol::Anthropic,
-                    ]
-                    .into_iter()
-                    .map(|protocol| {
-                        Button::new(SharedString::from(format!("protocol-{protocol:?}")))
-                            .label(protocol.label())
-                            .when(self.config.provider.protocol == protocol, |this| {
-                                this.primary()
-                            })
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.config.provider.protocol = protocol;
-                                let (base, model, key_env) = if protocol == ApiProtocol::Anthropic {
-                                    (
-                                        "https://api.anthropic.com/v1",
-                                        "claude-sonnet-4-6",
-                                        "ANTHROPIC_API_KEY",
-                                    )
-                                } else {
-                                    ("https://api.openai.com/v1", "gpt-4.1", "OPENAI_API_KEY")
-                                };
-                                this.provider
-                                    .update(cx, |state, cx| state.set_value(base, window, cx));
-                                this.model
-                                    .update(cx, |state, cx| state.set_value(model, window, cx));
-                                this.key_env
-                                    .update(cx, |state, cx| state.set_value(key_env, window, cx));
-                                cx.notify();
-                            }))
-                    }),
-                ),
-            )
-            .child(field("地址", Input::new(&self.provider), theme.clone()))
-            .child(field("模型", Input::new(&self.model), theme.clone()))
-            .child(field(
-                "密钥（本次运行）",
-                Input::new(&self.key),
-                theme.clone(),
-            ))
-            .child(field(
-                "密钥环境变量（重启后使用）",
-                Input::new(&self.key_env),
-                theme,
-            ))
+        self.provider_settings(cx)
     }
 
     fn appearance_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2142,7 +2386,7 @@ impl Preview {
             .child(page_title(
                 "界面",
                 "亮一点或暗一点，都只是换一层光。",
-                theme,
+                theme.clone(),
             ))
             .child(
                 h_flex()
@@ -2166,6 +2410,7 @@ impl Preview {
                             })),
                     ),
             )
+            .child(self.typography_page(cx))
     }
 
     fn memory_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2215,6 +2460,7 @@ impl Preview {
                 theme.clone(),
             ))
             .child(Input::new(&self.skill_path))
+            .child(self.skill_import_page(cx))
             .child(
                 h_flex()
                     .gap_2()
@@ -2246,11 +2492,16 @@ impl Preview {
                                 .ghost()
                                 .small()
                                 .label("移除目录")
+                                .when(index == 0, |button| button.label("Hikari 内置目录"))
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
+                                        if index == 0 {
+                                            return;
+                                        }
                                         this.config.skill_roots.remove(index);
-                                        this.save_config(cx);
-                                        this.refresh_skills(cx);
+                                        if this.persist_resources(cx) {
+                                            this.refresh_skills(cx);
+                                        }
                                     },
                                 )),
                             )
@@ -2293,6 +2544,7 @@ impl Preview {
                 "连接本机或远程工具服务。连接成功后，Hikari 就可以调用它们。",
                 theme.clone(),
             ))
+            .child(self.mcp_import_page(cx))
             .child(
                 h_flex()
                     .gap_2()
@@ -2373,9 +2625,10 @@ impl Preview {
                                     .checked(server.enabled)
                                     .on_change(cx.listener(move |this, value, window, cx| {
                                         this.config.mcp_servers[index].enabled = *value;
+                                        if this.persist_resources(cx) {
+                                            this.reconnect_mcp(cx);
+                                        }
                                         this.sync_mcp_editor(window, cx);
-                                        this.save_config(cx);
-                                        this.reconnect_mcp(cx);
                                     })),
                             )
                             .child(div().text_xs().child(detail))
@@ -2392,7 +2645,7 @@ impl Preview {
                                         .on_click(
                                             cx.listener(move |this, _, _, cx| {
                                                 let Some(config) = this
-                                                    .config
+                                                    .saved_config
                                                     .mcp_servers
                                                     .iter()
                                                     .find(|s| s.name == retry_name)
@@ -2402,9 +2655,11 @@ impl Preview {
                                                 };
                                                 let mcp = this.mcp.clone();
                                                 let tx = this.runtime_tx.clone();
+                                                let cwd = this.mcp_directory();
                                                 this.start_pump(cx);
                                                 thread::spawn(move || {
-                                                    let _ = mcp.connect(&config, &workspace_dir());
+                                                    let _ = std::fs::create_dir_all(&cwd)
+                                                        .map(|_| mcp.connect(&config, &cwd));
                                                     let _ = tx.send(RuntimeUpdate {
                                                         statuses: mcp.statuses(),
                                                     });
@@ -2422,8 +2677,11 @@ impl Preview {
                                         .on_click(
                                             cx.listener(move |this, _, window, cx| {
                                                 this.config.mcp_servers[index].enabled = false;
+                                                if !this.persist_resources(cx) {
+                                                    this.sync_mcp_editor(window, cx);
+                                                    return;
+                                                }
                                                 this.sync_mcp_editor(window, cx);
-                                                this.save_config(cx);
                                                 let mcp = this.mcp.clone();
                                                 let tx = this.runtime_tx.clone();
                                                 let name = disconnect_name.clone();
@@ -2447,9 +2705,10 @@ impl Preview {
                                         .on_click(
                                             cx.listener(move |this, _, window, cx| {
                                                 this.config.mcp_servers.remove(index);
+                                                if this.persist_resources(cx) {
+                                                    this.reconnect_mcp(cx);
+                                                }
                                                 this.sync_mcp_editor(window, cx);
-                                                this.save_config(cx);
-                                                this.reconnect_mcp(cx);
                                             }),
                                         ),
                                     ),
@@ -2463,79 +2722,6 @@ impl Preview {
                     .label("应用配置并连接")
                     .on_click(cx.listener(|this, _, _, cx| this.apply_mcp_config(cx))),
             )
-    }
-}
-
-fn message(line: &Line, ink: Ink) -> AnyElement {
-    match &line.body {
-        LineBody::User(text) => Message::new()
-            .alignment(MessageAlignment::End)
-            .content(
-                MessageContent::new().bubble(
-                    Bubble::new()
-                        .with_variant(BubbleVariant::Secondary)
-                        .child(text.clone()),
-                ),
-            )
-            .into_any_element(),
-        LineBody::Assistant { text, thinking, .. } => v_flex()
-            .gap_1()
-            .when(!thinking.is_empty(), |this| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(ink.muted)
-                        .child(thinking.clone()),
-                )
-            })
-            .child(
-                Message::new()
-                    .alignment(MessageAlignment::Start)
-                    .content(MessageContent::new().bubble(Bubble::new().child(text.clone()))),
-            )
-            .into_any_element(),
-        LineBody::Tool {
-            name,
-            detail,
-            running,
-            error,
-            ..
-        } => v_flex()
-            .w_full()
-            .max_w(px(560.))
-            .px_3()
-            .py_2()
-            .gap_1()
-            .rounded_lg()
-            .border_1()
-            .border_color(ink.line)
-            .bg(ink.input)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(if *error {
-                        hsla(0., 0.7, 0.65, 1.)
-                    } else {
-                        ink.muted
-                    })
-                    .child(if *running {
-                        format!("{name} · 正在做")
-                    } else {
-                        name.to_string()
-                    }),
-            )
-            .child(
-                div()
-                    .font_family("Consolas")
-                    .text_xs()
-                    .child(detail.clone()),
-            )
-            .into_any_element(),
-        LineBody::Note(text) => div()
-            .text_xs()
-            .text_color(ink.muted)
-            .child(text.clone())
-            .into_any_element(),
     }
 }
 

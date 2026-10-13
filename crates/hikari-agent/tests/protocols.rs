@@ -219,3 +219,92 @@ fn protocol_metadata_survives_session_serialization() {
         serde_json::from_str::<Message>(&serde_json::to_string(&message).unwrap()).unwrap()
     );
 }
+
+#[test]
+fn gateway_compatibility_changes_wire_fields_and_reasoning() {
+    let context = Context {
+        system_prompt: "base",
+        messages: &[],
+        tools: &[],
+    };
+    let mut config = ProviderConfig::default();
+    config.reasoning_effort = Some("high".into());
+    config.compatibility.max_tokens_field = "max_tokens".into();
+    config.compatibility.system_role = "developer".into();
+    config.compatibility.stream_usage = false;
+    config.compatibility.reasoning = false;
+    let body = request_body(&config, &context);
+    assert_eq!(body["max_tokens"], 8192);
+    assert!(body.get("max_completion_tokens").is_none());
+    assert!(body.get("stream_options").is_none());
+    assert!(body.get("reasoning_effort").is_none());
+    assert_eq!(body["messages"][0]["role"], "developer");
+    config.protocol = ApiProtocol::Responses;
+    config.compatibility.responses_store = true;
+    let body = request_body(&config, &context);
+    assert_eq!(body["store"], true);
+    assert!(body.get("include").is_none());
+    config.compatibility.reasoning = true;
+    assert_eq!(
+        request_body(&config, &context)["reasoning"]["effort"],
+        "high"
+    );
+    config.protocol = ApiProtocol::Anthropic;
+    config.max_output_tokens = 2048;
+    assert!(config.validate().is_err());
+    config.max_output_tokens = 8192;
+    assert_eq!(
+        request_body(&config, &context)["thinking"]["budget_tokens"],
+        4096
+    );
+}
+
+#[test]
+fn model_discovery_uses_endpoint_headers_auth_and_anthropic_pagination() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        for page in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut lines = Vec::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                lines.push(line.to_ascii_lowercase());
+            }
+            assert!(lines[0].starts_with("get /v1/models?limit=100"));
+            assert!(lines.iter().any(|line| line == "x-client: hikari\r\n"));
+            assert!(lines
+                .iter()
+                .any(|line| line == "x-api-key: test-credential\r\n"));
+            if page == 1 {
+                assert!(lines[0].contains("after_id=model-a"));
+            }
+            let body = if page == 0 {
+                json!({"data":[{"id":"model-a"}],"has_more":true,"last_id":"model-a"})
+            } else {
+                json!({"data":[{"id":"model-b"},{"id":"model-a"}],"has_more":false})
+            }
+            .to_string();
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+        }
+    });
+    let config = ProviderConfig {
+        protocol: ApiProtocol::Anthropic,
+        base_url: format!("http://{address}/v1/messages"),
+        headers: std::collections::BTreeMap::from([("X-Client".into(), "hikari".into())]),
+        ..Default::default()
+    };
+    assert_eq!(
+        hikari_agent::protocols::fetch_models(&config, "test-credential").unwrap(),
+        vec!["model-a", "model-b"]
+    );
+    server.join().unwrap();
+}

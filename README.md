@@ -26,6 +26,16 @@ cargo run
 
 工作区共用根目录的 `Cargo.lock` 和 `target`。
 
+## 设置与本地数据
+
+设置页可管理多个提供商及模型，配置请求头、三种协议的兼容项、思考支持/挡位、图片能力元数据、上下文与输出限制。支持获取模型 ID 列表、正文/代码/终端字体与字号预览，关于页可打开仓库、Issues 和 Releases，并检查正式版本更新。
+
+Skills 可从 Codex、Claude、Hermes 和通用 Agents 的资源目录扫描、勾选并复制到 `.hikari/skills`；也支持直接挂载目录。MCP 可从其他客户端的 JSON/TOML/YAML 配置扫描、勾选导入，导入服务默认停用，启用后才连接。
+
+设置保存在 `.hikari/config.json`，支持旧版迁移、校验、备份与原子替换。API key 按提供商明文保存，重启后恢复；留空时使用配置的环境变量。认证请求头用 `${ENV_NAME}` 引用。会话保存在 `.hikari/sessions.json`，包含工作区与置顶状态；图片附件和 SQLite 会话存储尚未接入。详细说明见 [Pi 接入文档](docs/pi-port.md)。
+
+新建会话默认“不选择工作区”，可在欢迎页下拉选择历史路径或通过系统窗口选择文件夹。普通对话固定使用 `.hikari/chat`；工作区会话的 Agent、终端及外部打开操作使用该会话的路径。未选择工作区时顶部终端和外部打开入口禁用。工作区历史保存到 `.hikari/workspaces.json`。侧栏会话支持右键重命名、置顶和删除；运行中的会话暂不可删除。
+
 
 ## visual
 ![page1](assets/page1.png)

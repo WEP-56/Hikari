@@ -8,6 +8,10 @@ use std::path::PathBuf;
 pub struct Session {
     pub id: u64,
     pub title: String,
+    #[serde(default)]
+    pub workspace: Option<PathBuf>,
+    #[serde(default)]
+    pub pinned: bool,
     pub transcript: Vec<Message>,
     pub context: Vec<Message>,
     pub retained_until: usize,

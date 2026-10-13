@@ -30,6 +30,8 @@ pub enum McpTransport {
         url: String,
         #[serde(default)]
         bearer_token_env: Option<String>,
+        #[serde(default)]
+        headers: BTreeMap<String, String>,
     },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +76,9 @@ impl McpServerConfig {
         if !(1..=300).contains(&self.timeout_seconds) {
             return Err(AgentError::new("MCP 超时需要在 1–300 秒内"));
         }
+        if let McpTransport::StreamableHttp { headers, .. } = &self.transport {
+            hikari_agent::protocols::validate_headers(headers)?;
+        }
         Ok(())
     }
 }
@@ -87,6 +92,7 @@ pub struct McpStatus {
 }
 struct Connected {
     config: McpServerConfig,
+    workspace: std::path::PathBuf,
     client: Arc<Mutex<Client>>,
     tools: Vec<RemoteToolDef>,
 }
@@ -192,6 +198,7 @@ impl McpManager {
                 config.name.clone(),
                 Connected {
                     config: config.clone(),
+                    workspace: workspace.to_path_buf(),
                     client: Arc::new(Mutex::new(client)),
                     tools,
                 },
@@ -229,7 +236,11 @@ impl McpManager {
                 .lock()
                 .unwrap()
                 .get(&config.name)
-                .is_some_and(|c| c.config == *config);
+                .is_some_and(|c| {
+                    c.config == *config
+                        && (!matches!(config.transport, McpTransport::Stdio { .. })
+                            || c.workspace == workspace)
+                });
             if !same && config.enabled {
                 let _ = self.connect_inner(config, workspace);
             }
@@ -347,6 +358,7 @@ enum Transport {
         http: ureq::Agent,
         url: String,
         token: String,
+        headers: BTreeMap<String, String>,
         session: Option<String>,
     },
 }
@@ -411,6 +423,7 @@ impl Client {
             McpTransport::StreamableHttp {
                 url,
                 bearer_token_env,
+                headers,
             } => {
                 let token = match bearer_token_env.as_ref().filter(|s| !s.is_empty()) {
                     Some(name) => std::env::var(name)
@@ -425,6 +438,7 @@ impl Client {
                         .build(),
                     url: url.clone(),
                     token,
+                    headers: hikari_agent::protocols::resolve_headers(headers)?,
                     session: None,
                 }
             }
@@ -448,6 +462,7 @@ impl Client {
         token: &str,
         session: Option<&str>,
         version: &str,
+        headers: &BTreeMap<String, String>,
     ) -> ureq::Request {
         let mut request = http
             .post(url)
@@ -458,6 +473,9 @@ impl Client {
         }
         if !token.is_empty() {
             request = request.set("Authorization", &format!("Bearer {token}"));
+        }
+        for (name, value) in headers {
+            request = request.set(name, value);
         }
         request
     }
@@ -513,11 +531,18 @@ impl Client {
                 url,
                 token,
                 session,
+                headers,
             } => {
-                let response =
-                    Self::http_request(http, url, token, session.as_deref(), &self.version)
-                        .send_json(body)
-                        .map_err(|e| redacted_http_error(e, token))?;
+                let response = Self::http_request(
+                    http,
+                    url,
+                    token,
+                    session.as_deref(),
+                    &self.version,
+                    headers,
+                )
+                .send_json(body)
+                .map_err(|e| redacted_http_error(e, token))?;
                 if method == "initialize" {
                     *session = response.header("Mcp-Session-Id").map(str::to_string);
                 }
@@ -552,7 +577,8 @@ impl Client {
                 url,
                 token,
                 session,
-            } => Self::http_request(http, url, token, session.as_deref(), &self.version)
+                headers,
+            } => Self::http_request(http, url, token, session.as_deref(), &self.version, headers)
                 .send_json(body)
                 .map(|_| ())
                 .map_err(|e| redacted_http_error(e, token)),
@@ -582,6 +608,7 @@ impl Client {
                 url,
                 token,
                 session,
+                headers,
             } => {
                 if let Some(id) = session.take() {
                     let mut request = http
@@ -590,6 +617,9 @@ impl Client {
                         .set("MCP-Protocol-Version", &self.version);
                     if !token.is_empty() {
                         request = request.set("Authorization", &format!("Bearer {token}"));
+                    }
+                    for (name, value) in headers {
+                        request = request.set(name, value);
                     }
                     let _ = request.call();
                 }

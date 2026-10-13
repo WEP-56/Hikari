@@ -104,6 +104,7 @@ fn streamable_http_session_pagination_tool_error_and_disconnect() {
         transport: McpTransport::StreamableHttp {
             url: format!("http://{address}/mcp"),
             bearer_token_env: None,
+            headers: Default::default(),
         },
         timeout_seconds: 5,
     };
@@ -151,7 +152,10 @@ while ($null -ne ($line = [Console]::ReadLine())) {
   $result = switch ($request.method) {
     'initialize' { @{ protocolVersion = '2025-06-18'; capabilities = @{ tools = @{} }; serverInfo = @{ name = 'fixture'; version = '1' } } }
     'tools/list' { @{ tools = @(@{ name = 'echo'; description = 'echo'; inputSchema = @{ type = 'object'; properties = @{ text = @{ type = 'string' } }; required = @('text') } }) } }
-    'tools/call' { @{ content = @(@{ type = 'text'; text = $request.params.arguments.text }) } }
+    'tools/call' {
+      $text = if ($request.params.arguments.text -eq '__cwd') { (Get-Location).Path } else { $request.params.arguments.text }
+      @{ content = @(@{ type = 'text'; text = $text }) }
+    }
   }
   [Console]::WriteLine((@{ jsonrpc = '2.0'; id = $request.id; result = $result } | ConvertTo-Json -Depth 20 -Compress))
 }
@@ -182,6 +186,22 @@ while ($null -ne ($line = [Console]::ReadLine())) {
             .call("mcp_local_echo", r#"{"text":"hikari fixture"}"#)
             .unwrap(),
         "hikari fixture"
+    );
+    let next_workspace = temp.path().join("workspace with spaces");
+    std::fs::create_dir_all(&next_workspace).unwrap();
+    manager.reconcile(&[config], &next_workspace);
+    let mut next_tools = ToolRegistry::empty();
+    manager.register(&mut next_tools).unwrap();
+    let cwd = next_tools
+        .call("mcp_local_echo", r#"{"text":"__cwd"}"#)
+        .unwrap();
+    assert_eq!(
+        std::path::Path::new(&cwd).canonicalize().unwrap(),
+        next_workspace.canonicalize().unwrap()
+    );
+    assert!(
+        tools.call("mcp_local_echo", "{}").is_err(),
+        "Old workspace connection is closed"
     );
     manager.disconnect("local");
     assert_eq!(manager.statuses()[0].state, "disconnected");

@@ -27,7 +27,11 @@ cargo run
 
 桌面应用位于 `crates/hikari`，是根工作区的默认启动目标；也可使用 `cargo run -p hikari` 显式选择。编译产物统一位于根目录 `target`，发布构建命令为 `cargo build --release`。
 
-设置 → 提供商：选择 Chat Completions、Responses 或 Anthropic，填写服务地址和模型名字。密钥输入框只用于本次运行；可在启动程序前设置 `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` 或配置中的自定义环境变量。点击“保存设置”持久化协议、地址、模型、人格、主题及管理设置，密钥值不写入配置。
+设置 → 提供商：选择 Chat Completions、Responses 或 Anthropic，填写服务地址和模型名字。API key 按提供商明文保存到本地配置，重启后恢复；留空时读取 `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` 或配置中的自定义环境变量。点击“保存设置”持久化密钥、协议、地址、模型、人格、主题及管理设置。
+
+现在可添加、切换、重命名或删除多个提供商，分别保存模型列表与元数据。获取模型列表复用当前地址、认证、请求头和超时；接口只返回 ID 时不猜测模型能力。支持配置思考/图片能力、可用思考挡位、上下文与最大输出。图片能力仅作为元数据，聊天附件尚未实现。思考挡位映射到实际 `reasoning_effort`；上下文用量使用当前保存模型的上限。请求头为 JSON 字符串映射，认证值必须使用 `${ENV_NAME}`；Chat 的 token 参数名称、系统角色、流用量，以及 Responses 的服务端存储可配置。
+
+普通设置保留草稿，保存前验证并在失败时继续使用原配置；可恢复已保存设置。聊天模型菜单使用已保存提供商/模型及支持的思考挡位，选择即保存。界面可分别设置正文、代码/工具输出、终端字体与字号，以及界面字号和正文行高。关于页面提供仓库/Issues/Releases 链接和 GitHub latest 正式 Release 的语义版本比较，不自动下载或安装。
 
 本地数据位于 `.hikari/config.json` 和 `.hikari/sessions.json`，已 gitignore。会话保存完整 transcript、当前模型 context、usage 和 retain 游标；上下文压缩生成独立 `ContextSummary`，界面历史保留完整原文。
 
@@ -36,6 +40,8 @@ cargo run
 ## MCP
 
 设置 → MCP：可添加本机 stdio 命令或远程 Streamable HTTP URL，显示连接状态和已发现的工具，支持启停、重连、断开、移除。高级 JSON 可编辑参数、认证环境变量及超时，例如：
+
+可先扫描 Claude Desktop/CLI、Codex 和 Hermes 的常用配置，预览来源和启动命令/URL，勾选导入并决定是否覆盖同名配置。扫描只检查文件，不启动服务；导入服务默认停用。无效条目单独报告，所选来源重名时需要只选一个。HTTP 请求头支持字符串映射和 `${ENV_NAME}`，Codex 的 `env_http_headers`、`bearer_token_env_var` 会转换为 Hikari 格式；包含明文认证头或旧版 SSE 的条目会报告诊断。
 
 ```json
 [
@@ -70,6 +76,8 @@ cargo run
 ## Skill
 
 设置 → Skill：添加一个 Skill 目录或包含多个 Skill 的目录，重新扫描、逐项启停或移除目录。默认扫描 `.hikari/skills`。`SKILL.md` 必须有 YAML frontmatter 的 `name`、`description`。支持多行描述，重复名称和无效文件显示诊断。
+
+Hikari 自己的 `.hikari/skills` 始终优先扫描。可扫描 Codex/Claude/Hermes/Agents 的用户和项目 Skills，包括自定义 `CODEX_HOME`、`HERMES_HOME`，或填写来源目录单独扫描。勾选后复制 SKILL.md、脚本和参考资料到 Hikari 目录，不改变来源，不覆盖已有同名 Skill，不复制符号链接。也可继续使用“添加目录”直接挂载。启停和目录管理单独持久化。
 
 系统提示仅提供已启用 Skill 的元信息；模型调用 `load_skill(name)` 读取完整指令。`load_skill(name, resource)` 可继续读取该 Skill 目录内的文本资源。模型使用 shell 执行 Skill 脚本，或使用工具读取其他文件。当前不提供在线安装市场。
 

@@ -73,6 +73,12 @@ impl Shell {
     }
 }
 
+impl Drop for Shell {
+    fn drop(&mut self) {
+        let _ = self._child.kill();
+    }
+}
+
 fn strip_ansi(input: &str) -> String {
     let mut out = String::new();
     let mut chars = input.chars().peekable();
