@@ -18,3 +18,6 @@ Desktop.ini
 # 本机配置与会话（不提交密钥、对话和 MCP 环境变量）
 .hikari/
 
+# GitHub Pages 本地依赖与构建产物
+pages/node_modules/
+pages/dist/
