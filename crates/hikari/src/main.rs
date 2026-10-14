@@ -2163,12 +2163,26 @@ enum OpenTarget {
     Bash,
 }
 
+/// 应用根目录：源码构建是仓库根目录，安装包运行时可执行文件所在目录。
+/// `CARGO_MANIFEST_DIR` 是编译期路径，安装到用户机器后并不存在，因此用它判断是否为源码构建。
 fn workspace_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(PathBuf::from)
-        .and_then(|path| path.parent().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("."))
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let manifest_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(PathBuf::from)
+            .and_then(|path| path.parent().map(PathBuf::from));
+        if let Some(root) =
+            manifest_root.filter(|root| root.join("crates/hikari/Cargo.toml").is_file())
+        {
+            return root;
+        }
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("."))
+    })
+    .clone()
 }
 
 fn open_workspace(target: OpenTarget, dir: &std::path::Path) -> std::io::Result<()> {
