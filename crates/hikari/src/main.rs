@@ -127,6 +127,7 @@ struct RuntimeUpdate {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
     Provider,
+    OtherProviders,
     Appearance,
     Memory,
     Persona,
@@ -137,9 +138,10 @@ enum Section {
 }
 
 impl Section {
-    fn all() -> [Section; 8] {
+    fn all() -> [Section; 9] {
         [
             Section::Provider,
+            Section::OtherProviders,
             Section::Appearance,
             Section::Memory,
             Section::Persona,
@@ -153,6 +155,7 @@ impl Section {
     fn label(self) -> &'static str {
         match self {
             Section::Provider => "提供商",
+            Section::OtherProviders => "其它提供商",
             Section::Appearance => "界面",
             Section::Memory => "记忆",
             Section::Persona => "人格",
@@ -684,6 +687,16 @@ impl Preview {
         let mcp_configs = self.saved_config.mcp_servers.clone();
         let runtime_tx = self.runtime_tx.clone();
         let max_tool_rounds = self.saved_config.max_tool_rounds;
+        let web_config = self.saved_config.web.clone();
+        let history_store = self.session_store.clone();
+        let history_core = self.memory_core.clone();
+        let artifact_root = self
+            .session_store
+            .path()
+            .parent()
+            .unwrap()
+            .join("artifacts")
+            .join(format!("talk-{talk_id}"));
         let directory_prompt = format!(
             "\n当前会话的工作目录：{}。相对文件路径与命令都以此目录为基准。",
             cwd.display()
@@ -694,8 +707,18 @@ impl Preview {
                 statuses: mcp.statuses(),
             });
             let mut tools = ToolRegistry::workspace(cwd);
-            let setup_error = skills
-                .register(&mut tools)
+            let setup_error = tools
+                .enable_artifacts(artifact_root)
+                .and_then(|_| hikari_runtime::web::register(web_config, &mut tools))
+                .and_then(|_| {
+                    hikari_runtime::history::register(
+                        history_store,
+                        history_core,
+                        talk_id,
+                        &mut tools,
+                    )
+                })
+                .and_then(|_| skills.register(&mut tools))
                 .and_then(|_| mcp.register(&mut tools))
                 .and_then(|_| {
                     memory_scope
@@ -718,7 +741,13 @@ impl Preview {
                 retained_until,
                 context_base,
                 query: text.clone(),
-                system_prompt: format!("{}{}{}", persona_prompt, skills.prompt(), directory_prompt),
+                system_prompt: format!(
+                    "{}{}{}{}",
+                    persona_prompt,
+                    skills.prompt(),
+                    directory_prompt,
+                    mcp.discovery_prompt()
+                ),
                 context_limit_tokens: provider_config.context_tokens,
                 max_tool_rounds,
             };
@@ -1037,6 +1066,8 @@ impl Preview {
             }
         }
         if persist {
+            let talk = &mut self.talks[idx];
+            hikari_runtime::session::sync_transcript_origins(&mut talk.transcript, &talk.messages);
             self.save_sessions();
         }
         if follow {
@@ -1152,7 +1183,9 @@ fn talk_from_session(session: Session) -> Talk {
                     error: *is_error,
                 },
             }),
-            AgentMessage::ContextSummary { .. } | AgentMessage::Assistant { .. } => None,
+            AgentMessage::ContextSummary { .. }
+            | AgentMessage::ToolCatalog { .. }
+            | AgentMessage::Assistant { .. } => None,
         })
         .collect();
     let preview = session
@@ -2537,6 +2570,7 @@ impl Preview {
         let theme = cx.theme().colors.clone();
         let body = match self.section {
             Section::Provider => div().child(self.provider_page(cx)),
+            Section::OtherProviders => div().child(self.other_providers_page(cx)),
             Section::Appearance => div().child(self.appearance_page(cx)),
             Section::Memory => div().child(self.memory_page(cx)),
             Section::Persona => div().child(self.persona_page(cx)),
@@ -2551,8 +2585,10 @@ impl Preview {
             Section::About => div().child(self.about_page(cx)),
         };
 
-        let configurable = matches!(self.section, Section::Provider | Section::Appearance)
-            || (self.section == Section::Memory && self.memory_tab == 1);
+        let configurable = matches!(
+            self.section,
+            Section::Provider | Section::OtherProviders | Section::Appearance
+        ) || (self.section == Section::Memory && self.memory_tab == 1);
         v_flex()
             .flex_1()
             .min_w_0()

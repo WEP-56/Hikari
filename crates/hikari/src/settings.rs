@@ -10,7 +10,7 @@ const CUSTOM_FONT: &str = "手动输入…";
 type FontSelect = SelectState<SearchableVec<String>>;
 use hikari_agent::{AgentError, ApiProtocol, ProviderConfig, Result};
 use hikari_runtime::imports::{import_skill, mcp_sources, merge_mcp, scan_mcp, skill_sources};
-use hikari_runtime::{AppearanceConfig, ModelMetadata, ProviderProfile};
+use hikari_runtime::{web::SearchProvider, AppearanceConfig, ModelMetadata, ProviderProfile};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum PickerView {
@@ -38,9 +38,17 @@ pub(super) struct SettingsDraft {
     levels: Entity<InputState>,
     thinking: bool,
     images: bool,
+    tool_disclosure: hikari_agent::protocols::ToolDisclosure,
+    pub(super) web_profiles: [WebDraft; 3],
+    web_timeout: Entity<InputState>,
     fonts: Vec<Entity<InputState>>,
     font_selects: Vec<Entity<FontSelect>>,
     custom_fonts: [bool; 3],
+}
+pub(super) struct WebDraft {
+    pub(super) key: Entity<InputState>,
+    pub(super) env: Entity<InputState>,
+    pub(super) endpoint: Entity<InputState>,
 }
 fn input(
     value: impl Into<SharedString>,
@@ -192,6 +200,20 @@ impl SettingsDraft {
             levels: input(meta.thinking_levels.join(", "), window, cx),
             thinking: meta.supports_thinking,
             images: meta.supports_images,
+            tool_disclosure: meta.tool_disclosure,
+            web_profiles: SearchProvider::ALL.map(|provider| {
+                let profile = config.web.profile(provider);
+                WebDraft {
+                    key: cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .masked(true)
+                            .default_value(profile.api_key.clone())
+                    }),
+                    env: input(profile.api_key_env.clone(), window, cx),
+                    endpoint: input(profile.endpoint.clone(), window, cx),
+                }
+            }),
+            web_timeout: input(config.web.timeout_seconds.to_string(), window, cx),
             fonts,
             font_selects,
             custom_fonts: [false; 3],
@@ -221,6 +243,89 @@ fn home() -> PathBuf {
 }
 
 impl Preview {
+    pub(super) fn other_providers_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let profile = &self.settings_draft.web_profiles[self.config.web.provider.index()];
+        let content = v_flex()
+            .gap_4()
+            .child(
+                Switch::new("web-enabled")
+                    .label("启用网页搜索")
+                    .checked(self.config.web.enabled)
+                    .on_change(cx.listener(|this, enabled, _, cx| {
+                        this.config.web.enabled = *enabled;
+                        this.settings_dirty = true;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                h_flex().gap_2().children(
+                    [
+                        (SearchProvider::Tavily, "Tavily"),
+                        (SearchProvider::Exa, "Exa"),
+                        (SearchProvider::Serper, "Serper"),
+                    ]
+                    .into_iter()
+                    .map(|(provider, label)| {
+                        let button = Button::new(SharedString::from(format!("web-{label}")))
+                            .label(label)
+                            .when(self.config.web.provider == provider, |button| {
+                                button.primary()
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.config.web.provider = provider;
+                                this.settings_dirty = true;
+                                cx.notify();
+                            }));
+                        let holder = div().relative().child(button);
+                        #[cfg(test)]
+                        let holder = holder.child(
+                            canvas(
+                                |_, _, _| (),
+                                move |bounds, _, _, _| {
+                                    super::chat::tests::record_bounds(
+                                        format!("web-{label}"),
+                                        bounds,
+                                    );
+                                },
+                            )
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full(),
+                        );
+                        holder
+                    }),
+                ),
+            )
+            .child(settings_row(
+                "API Key",
+                Input::new(&profile.key),
+                cx,
+            ))
+            .child(settings_row(
+                "密钥环境变量",
+                Input::new(&profile.env),
+                cx,
+            ))
+            .child(settings_row(
+                "自定义地址",
+                Input::new(&profile.endpoint),
+                cx,
+            ))
+            .child(settings_row(
+                "超时（秒）",
+                Input::new(&self.settings_draft.web_timeout),
+                cx,
+            ))
+            .child(settings_label(
+                "各提供商配置独立保存；搜索使用选中的提供商。地址留空使用默认接口，密钥留空读取环境变量。",
+                cx,
+            ));
+        v_flex()
+            .gap_4()
+            .child(settings_heading("其它提供商"))
+            .child(settings_card(content, cx))
+    }
     #[cfg(test)]
     pub(super) fn verify_provider_key_persistence(
         &mut self,
@@ -277,6 +382,23 @@ impl Preview {
             .unwrap()
             .api_key
             .is_empty());
+        self.edit_model(0, window, cx);
+        self.settings_draft.tool_disclosure =
+            hikari_agent::protocols::ToolDisclosure::ResponsesToolSearch;
+        self.save_config(cx);
+        assert!(!self.settings_dirty);
+        let restarted = self.config_store.load().unwrap();
+        let profile = restarted.providers.iter().find(|p| p.id == second).unwrap();
+        assert_eq!(
+            profile.models[0].tool_disclosure,
+            hikari_agent::protocols::ToolDisclosure::ResponsesToolSearch
+        );
+        self.settings_draft.tool_disclosure = hikari_agent::protocols::ToolDisclosure::Compatible;
+        self.discard_settings(window, cx);
+        assert_eq!(
+            self.settings_draft.tool_disclosure,
+            hikari_agent::protocols::ToolDisclosure::ResponsesToolSearch
+        );
     }
 
     pub(super) fn persist_resources(&mut self, cx: &mut Context<Self>) -> bool {
@@ -747,7 +869,15 @@ impl Preview {
             self.settings_draft.rounds.clone(),
             self.settings_draft.model_name.clone(),
             self.settings_draft.levels.clone(),
+            self.settings_draft.web_timeout.clone(),
         ];
+        for profile in &self.settings_draft.web_profiles {
+            inputs.extend([
+                profile.key.clone(),
+                profile.env.clone(),
+                profile.endpoint.clone(),
+            ]);
+        }
         for (slot, select) in self.settings_draft.font_selects.iter().cloned().enumerate() {
             self._subscriptions.push(cx.subscribe_in(
                 &select,
@@ -800,6 +930,14 @@ impl Preview {
         config.memory.auto_items = number(&self.memory_items, "自动召回条数", cx)?;
         config.dark = self.dark;
         config.appearance = self.read_appearance(cx)?;
+        for provider in SearchProvider::ALL {
+            let draft = &self.settings_draft.web_profiles[provider.index()];
+            let profile = config.web.profile_mut(provider);
+            profile.api_key = read(&draft.key, cx);
+            profile.api_key_env = read(&draft.env, cx);
+            profile.endpoint = read(&draft.endpoint, cx);
+        }
+        config.web.timeout_seconds = number(&self.settings_draft.web_timeout, "Web 超时", cx)?;
         config.sync_active()?;
         config.validate()?;
         Ok(config)
@@ -838,6 +976,7 @@ impl Preview {
                     supports_images: d.images,
                     context_tokens: number(&d.context, "上下文", cx)?,
                     max_output_tokens: number(&d.output, "最大输出", cx)?,
+                    tool_disclosure: d.tool_disclosure,
                 };
                 let model_id = meta.id.clone();
                 let context_tokens = meta.context_tokens;
@@ -849,6 +988,7 @@ impl Preview {
                     profile.config.model = model_id;
                     profile.config.context_tokens = context_tokens;
                     profile.config.max_output_tokens = max_output_tokens;
+                    profile.config.compatibility.tool_disclosure = d.tool_disclosure;
                     if !supports_thinking
                         || profile
                             .config
@@ -932,6 +1072,20 @@ impl Preview {
         });
         let rounds = self.config.max_tool_rounds.to_string();
         let appearance = self.config.appearance.clone();
+        for provider in SearchProvider::ALL {
+            let profile = self.config.web.profile(provider);
+            let draft = &self.settings_draft.web_profiles[provider.index()];
+            for (state, value) in [
+                (draft.key.clone(), profile.api_key.clone()),
+                (draft.env.clone(), profile.api_key_env.clone()),
+                (draft.endpoint.clone(), profile.endpoint.clone()),
+            ] {
+                state.update(cx, |state, cx| state.set_value(value, window, cx));
+            }
+        }
+        self.settings_draft.web_timeout.update(cx, |state, cx| {
+            state.set_value(self.config.web.timeout_seconds.to_string(), window, cx)
+        });
         self.settings_draft
             .rounds
             .update(cx, |state, cx| state.set_value(rounds, window, cx));
@@ -1009,6 +1163,7 @@ impl Preview {
             .update(cx, |state, cx| state.set_value(levels, window, cx));
         self.settings_draft.thinking = model.supports_thinking;
         self.settings_draft.images = model.supports_images;
+        self.settings_draft.tool_disclosure = model.tool_disclosure;
     }
     pub(super) fn stash_visible_key(&mut self, cx: &App) {
         if let Some(id) = self.provider_focus.clone() {
@@ -1484,6 +1639,41 @@ impl Preview {
                         cx.notify();
                     })),
             )
+            .child(settings_label(
+                "工具增量披露：仅为已验证支持的模型和接口开启。",
+                cx,
+            ))
+            .child(
+                h_flex().gap_2().flex_wrap().children(
+                    [
+                        (hikari_agent::protocols::ToolDisclosure::Compatible, "兼容"),
+                        (
+                            hikari_agent::protocols::ToolDisclosure::ResponsesAdditionalTools,
+                            "Responses · additional_tools",
+                        ),
+                        (
+                            hikari_agent::protocols::ToolDisclosure::ResponsesToolSearch,
+                            "Responses · tool_search",
+                        ),
+                        (
+                            hikari_agent::protocols::ToolDisclosure::AnthropicInlineTools,
+                            "Messages · inline tools",
+                        ),
+                    ]
+                    .into_iter()
+                    .map(|(mode, label)| {
+                        Button::new(SharedString::from(format!("disclosure-{mode:?}")))
+                            .small()
+                            .label(label)
+                            .when(d.tool_disclosure == mode, |b| b.primary())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.settings_draft.tool_disclosure = mode;
+                                this.settings_dirty = true;
+                                cx.notify();
+                            }))
+                    }),
+                ),
+            )
     }
     fn advanced_section(
         &self,
@@ -1762,6 +1952,7 @@ impl Preview {
             supports_images: false,
             context_tokens,
             max_output_tokens,
+            tool_disclosure: Default::default(),
         });
         let index = profile.models.len() - 1;
         self.model_focus = Some(index);

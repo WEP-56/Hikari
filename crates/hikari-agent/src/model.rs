@@ -31,6 +31,10 @@ pub enum Message {
     ContextSummary {
         text: String,
     },
+    /// Host-owned snapshot of model-visible tools. Not conversation or memory evidence.
+    ToolCatalog {
+        tools: Vec<crate::provider::ToolDef>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -80,6 +84,7 @@ impl Message {
             | Self::Assistant { text, .. }
             | Self::ToolResult { text, .. } => text,
             Self::ContextSummary { text } => text,
+            Self::ToolCatalog { .. } => "",
         }
     }
 
@@ -101,6 +106,7 @@ impl Message {
             }
             Self::ToolResult { text, name, .. } => text.chars().count() + name.chars().count(),
             Self::ContextSummary { text } => text.chars().count(),
+            Self::ToolCatalog { tools } => serde_json::to_vec(tools).map_or(0, |v| v.len()),
         }
     }
     pub fn origin(&self) -> Option<&MessageOrigin> {

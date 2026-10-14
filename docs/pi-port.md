@@ -17,6 +17,8 @@ Hikari 的 agent 是 Pi 的改造版。桌面 agent、模型协议、MCP、Skill
 
 MCP 和 Skill 的上游实现已从本地参考目录删除，本阶段在 `hikari-runtime` 补齐，全部通过 `ToolRegistry` 暴露给同一个 loop。
 
+本轮另参考 [earendil-works/pi](https://github.com/earendil-works/pi/tree/f13c00fb3a4d77ad3faa815057e31d614d42b3f1)：Hikari 采用自有 Rust BM25 发现和 ToolCatalog，按配置转换 Responses `additional_tools` / 客户端 `tool_search_call` + `tool_search_output`，或 Messages `tool_addition` / `tool_removal`；默认兼容路径发送当前完整定义，不自动启用服务端原生搜索。MCP 重连和每轮 tools/list 刷新目录，调用前复核工具仍存在且 schema 未改变。
+
 ## 运行
 
 在 `E:\Hikari` 执行：

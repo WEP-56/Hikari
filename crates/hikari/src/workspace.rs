@@ -337,6 +337,17 @@ impl Preview {
             _ => {}
         }
         self.save_sessions();
+        if !self
+            .session_store
+            .load()
+            .is_ok_and(|sessions| sessions.iter().all(|s| s.id != id))
+        {
+            cx.notify();
+            return;
+        }
+        if let Err(error) = self.session_store.remove_artifacts(id) {
+            self.management_notice = error.message;
+        }
         cx.notify();
     }
 

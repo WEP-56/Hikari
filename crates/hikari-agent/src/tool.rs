@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 #[cfg(windows)]
@@ -5,7 +6,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -41,6 +42,9 @@ pub trait Tool: Send + Sync {
 pub struct ToolRegistry {
     tools: Vec<Arc<dyn Tool>>,
     defs: Vec<ToolDef>,
+    deferred: BTreeMap<String, String>,
+    loaded: Mutex<Vec<String>>,
+    artifacts: Option<PathBuf>,
 }
 
 impl ToolRegistry {
@@ -53,7 +57,13 @@ impl ToolRegistry {
                 parameters: tool.parameters(),
             })
             .collect();
-        Self { tools, defs }
+        Self {
+            tools,
+            defs,
+            deferred: BTreeMap::new(),
+            loaded: Mutex::new(Vec::new()),
+            artifacts: None,
+        }
     }
 
     pub fn empty() -> Self {
@@ -94,8 +104,111 @@ impl ToolRegistry {
         &self.defs
     }
 
+    pub fn visible_defs(&self) -> Vec<ToolDef> {
+        let loaded = self.loaded.lock().unwrap();
+        let mut defs: Vec<_> = self
+            .defs
+            .iter()
+            .filter(|d| !self.deferred.contains_key(&d.name))
+            .cloned()
+            .collect();
+        defs.extend(
+            loaded
+                .iter()
+                .filter_map(|name| self.defs.iter().find(|d| &d.name == name))
+                .cloned(),
+        );
+        defs
+    }
+    pub fn has_deferred(&self) -> bool {
+        !self.deferred.is_empty()
+    }
+
+    pub fn restore_loaded(&self, tools: &[ToolDef]) {
+        *self.loaded.lock().unwrap() = tools
+            .iter()
+            .filter(|d| self.deferred.contains_key(&d.name))
+            .map(|d| d.name.clone())
+            .collect();
+    }
+
+    pub fn register_deferred(
+        &mut self,
+        tool: Arc<dyn Tool>,
+        namespace: String,
+    ) -> std::result::Result<(), String> {
+        let name = tool.name().to_owned();
+        self.register(tool)?;
+        self.deferred.insert(name, namespace);
+        if !self.defs.iter().any(|d| d.name == "tool_search") {
+            self.defs.push(crate::tool_search::definition());
+        }
+        Ok(())
+    }
+
+    pub fn enable_artifacts(&mut self, root: PathBuf) -> std::result::Result<(), String> {
+        if self.defs.iter().any(|d| d.name == "artifact_read") {
+            return Err("重复工具名：artifact_read".into());
+        }
+        fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+        self.artifacts = Some(root);
+        self.defs.push(ToolDef { name: "artifact_read".into(), description: "按字符范围继续读取本会话的长工具输出。offset 从 0 开始，返回 next_offset。".into(), parameters: json!({"type":"object","properties":{"id":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":12000}},"required":["id"],"additionalProperties":false}) });
+        Ok(())
+    }
+
+    fn finish_output(&self, text: String, cap: usize) -> String {
+        if text.chars().count() <= cap {
+            return text;
+        }
+        if let Some(root) = &self.artifacts {
+            use sha2::{Digest, Sha256};
+            let id = format!("{:x}", Sha256::digest(text.as_bytes()));
+            match fs::write(root.join(format!("{id}.txt")), &text) {
+                Ok(()) => {
+                    return format!(
+                        "{}\n[完整输出已保存：artifact_read id={id}，offset={cap}，共 {} 字符]",
+                        text.chars().take(cap).collect::<String>(),
+                        text.chars().count()
+                    )
+                }
+                Err(e) => return format!("{}\n[完整输出保存失败：{e}]", cap_chars(&text, cap)),
+            }
+        }
+        cap_chars(&text, cap)
+    }
+
+    fn read_artifact(&self, arguments: &str) -> std::result::Result<String, String> {
+        let args: Value = serde_json::from_str(arguments).map_err(|e| e.to_string())?;
+        let id = args["id"].as_str().ok_or("缺少 id")?;
+        if id.len() != 64 || !id.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err("artifact id 无效".into());
+        }
+        let root = self.artifacts.as_ref().ok_or("未启用 artifact 存储")?;
+        let text = fs::read_to_string(root.join(format!("{id}.txt"))).map_err(|e| e.to_string())?;
+        let offset = args
+            .get("offset")
+            .map(|v| v.as_u64().ok_or("offset 无效"))
+            .transpose()?
+            .unwrap_or(0) as usize;
+        let limit = args
+            .get("limit")
+            .map(|v| {
+                v.as_u64()
+                    .filter(|n| (1..=12000).contains(n))
+                    .ok_or("limit 需要在 1–12000 内")
+            })
+            .transpose()?
+            .unwrap_or(6000) as usize;
+        let part: String = text.chars().skip(offset).take(limit).collect();
+        let total = text.chars().count();
+        let next = offset.saturating_add(part.chars().count()).min(total);
+        Ok(json!({"id":id,"offset":offset,"text":part,"next_offset":next,"total_chars":total,"has_more":next<total}).to_string())
+    }
+
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> std::result::Result<(), String> {
-        if self.tools.iter().any(|t| t.name() == tool.name()) {
+        if matches!(tool.name(), "tool_search" | "artifact_read")
+            || self.defs.iter().any(|t| t.name == tool.name())
+        {
             return Err(format!("重复工具名：{}", tool.name()));
         }
         self.defs.push(ToolDef {
@@ -113,24 +226,32 @@ impl ToolRegistry {
         arguments: &str,
         abort: &AtomicBool,
     ) -> std::result::Result<String, String> {
+        if abort.load(Ordering::Relaxed) {
+            return Err("已取消工具调用".into());
+        }
+        if name == "tool_search" {
+            return crate::tool_search::search(&self.defs, &self.deferred, &self.loaded, arguments);
+        }
+        if name == "artifact_read" {
+            return self.read_artifact(arguments);
+        }
+        if self.deferred.contains_key(name)
+            && !self.loaded.lock().unwrap().iter().any(|n| n == name)
+        {
+            return Err("工具尚未加载，请先调用 tool_search".into());
+        }
         let tool = self
             .tools
             .iter()
             .find(|t| t.name() == name)
             .ok_or_else(|| format!("没有名为 {name} 的工具"))?;
         tool.call_with_abort(arguments, abort)
-            .map(|s| cap_chars(&s, tool.output_limit()))
-            .map_err(|s| cap_chars(&s, OUTPUT_CAP))
+            .map(|s| self.finish_output(s, tool.output_limit()))
+            .map_err(|s| self.finish_output(s, OUTPUT_CAP))
     }
 
     pub fn call(&self, name: &str, arguments: &str) -> std::result::Result<String, String> {
-        let Some(tool) = self.tools.iter().find(|tool| tool.name() == name) else {
-            return Err(format!("没有名为 {name} 的工具"));
-        };
-        match tool.call(arguments) {
-            Ok(text) => Ok(cap_chars(&text, tool.output_limit())),
-            Err(err) => Err(cap_chars(&err, OUTPUT_CAP)),
-        }
+        self.call_with_abort(name, arguments, &AtomicBool::new(false))
     }
 }
 
@@ -233,8 +354,8 @@ fn run_command(
         .map_err(|err| format!("命令没有启动。{err}"))?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let out_handle = thread::spawn(move || read_capped(stdout, 12_000));
-    let err_handle = thread::spawn(move || read_capped(stderr, 4_000));
+    let out_handle = thread::spawn(move || read_capped(stdout, 8 * 1024 * 1024));
+    let err_handle = thread::spawn(move || read_capped(stderr, 8 * 1024 * 1024));
     let started = Instant::now();
     let status = loop {
         match child.try_wait() {
@@ -335,11 +456,7 @@ fn read_workspace_file(root: &Path, user_path: &str) -> std::result::Result<Stri
         return Err("这是二进制文件".into());
     }
     let text = String::from_utf8_lossy(&bytes);
-    let mut out: String = text.chars().take(32_000).collect();
-    if text.chars().count() > 32_000 {
-        out.push_str("\n…后面截断了");
-    }
-    Ok(out)
+    Ok(text.into_owned())
 }
 
 fn resolve_inside(root: &Path, user_path: &str) -> std::result::Result<PathBuf, String> {

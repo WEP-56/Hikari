@@ -662,6 +662,18 @@ impl Core {
     pub fn browse(&self, query: &str, offset: usize) -> Result<Vec<Unit>> {
         self.browse_view(query, offset, BrowseView::Memory)
     }
+    pub fn suppressed_sources(&self) -> Result<HashSet<String>> {
+        let db = self.db.lock().unwrap();
+        let mut statement = db
+            .prepare("SELECT id FROM suppressed_sources")
+            .map_err(error)?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(error)?
+            .collect::<std::result::Result<HashSet<_>, _>>()
+            .map_err(error)?;
+        Ok(ids)
+    }
     pub fn browse_view(&self, query: &str, offset: usize, view: BrowseView) -> Result<Vec<Unit>> {
         let db = self.db.lock().unwrap();
         if !query.trim().is_empty() {

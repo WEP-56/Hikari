@@ -10,7 +10,7 @@ pub struct Context<'a> {
     pub tools: &'a [ToolDef],
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolDef {
     pub name: String,
     pub description: String,
@@ -38,6 +38,16 @@ pub enum StreamEvent {
 
 /// 只负责把上下文变成流。
 pub trait Provider: Send + Sync {
+    /// Conservative fallback; protocol providers estimate their actual request body.
+    fn input_tokens(&self, context: &Context<'_>) -> u32 {
+        let bytes = context.system_prompt.len()
+            + serde_json::to_vec(context.messages).map_or(0, |v| v.len())
+            + serde_json::to_vec(context.tools).map_or(0, |v| v.len());
+        u32::try_from(bytes.div_ceil(3)).unwrap_or(u32::MAX)
+    }
+    fn output_reserve(&self) -> u32 {
+        0
+    }
     fn stream(
         &self,
         context: &Context<'_>,

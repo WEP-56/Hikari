@@ -221,6 +221,7 @@ fn models_and_provider_switch_restore_independent_limits_and_thinking() {
         thinking_levels: vec!["high".into()],
         context_tokens: 64_000,
         max_output_tokens: 4096,
+        tool_disclosure: hikari_agent::protocols::ToolDisclosure::ResponsesToolSearch,
         ..Default::default()
     });
     profile.select_model("reasoner").unwrap();
@@ -230,10 +231,18 @@ fn models_and_provider_switch_restore_independent_limits_and_thinking() {
     store.save(&config).unwrap();
     let mut config = store.load().unwrap();
     assert_eq!(config.provider.context_tokens, 64_000);
+    assert_eq!(
+        config.provider.compatibility.tool_disclosure,
+        hikari_agent::protocols::ToolDisclosure::ResponsesToolSearch
+    );
     assert_eq!(config.provider.reasoning_effort.as_deref(), Some("high"));
     config.providers[1].select_model("gpt-4.1").unwrap();
     config.activate("local").unwrap();
     assert_eq!(config.provider.context_tokens, 128_000);
+    assert_eq!(
+        config.provider.compatibility.tool_disclosure,
+        hikari_agent::protocols::ToolDisclosure::Compatible
+    );
     assert_eq!(config.provider.reasoning_effort, None);
     config.activate("default").unwrap();
     assert_eq!(config.provider.max_output_tokens, 8192);

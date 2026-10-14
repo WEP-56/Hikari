@@ -1,4 +1,5 @@
 pub mod config;
+pub mod history;
 pub mod imports;
 pub mod mcp;
 pub mod memory;
@@ -7,6 +8,7 @@ pub mod preferences;
 pub mod session;
 pub mod skills;
 pub mod updates;
+pub mod web;
 pub mod workspace;
 
 pub use config::{AppConfig, ConfigStore};

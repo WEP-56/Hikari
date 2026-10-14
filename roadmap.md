@@ -13,6 +13,10 @@ Hikari 是基于 Rust、GPUI Kit 的桌面 AI Agent，定位为注重长期记�
 
 附件和工具结果的数据结构先确定，再接入图片生成。执行任务底座服务于后台进程和子 Agent，不扩展为跨会话任务管理系统。
 
+### 实施进度（2026-10-14）
+
+第一批已接入并测试、验证：完整请求预算、MCP tool-search、Responses/Messages 协议适配、Web 工具、历史检索、长输出 artifact 均已实现。MCP 每轮刷新目录并在调用前核对撤回/重定义；工具加载状态随会话保存和压缩恢复。Responses 移除/重定义回退兼容路径，默认不启用原生增量披露。Web 使用 Tavily/Exa/Serper 配置，session 工具过滤关闭记忆和遗忘来源，artifact_read 支持 Unicode 字符分页。
+
 ## 工具
 
 | 工具 | 范围与交互 |
@@ -44,7 +48,7 @@ web_search 和 image_gen 的提供商配置放在同一设置页面，作为“�
 - 区分没有匹配工具、服务不可用和执行失败；连接重建、工具列表变化时更新目录，并使已撤回工具不可调用。
 - 工具可见性不代表执行授权，实际调用仍须经过权限检查。
 
-参考实现：earendil-works/pi，检查版本 f13c00fb3a4d77ad3faa815057e31d614d42b3f1。本地 examples/pi_agent_rust 未找到 tool-search 实现。
+参考实现：earendil-works/pi，检查版本 f13c00fb3a4d77ad3faa815057e31d614d42b3f1。本地 examples/pi_agent_rust 无 tool-search 实现，必要时拉取earendil-works/pi 到本地。
 
 | 协议 | 参考仓库的实现路径 |
 |---|---|

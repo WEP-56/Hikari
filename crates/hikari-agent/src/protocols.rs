@@ -58,6 +58,16 @@ pub struct CompatibilityConfig {
     pub system_role: String,
     pub responses_store: bool,
     pub reasoning: bool,
+    pub tool_disclosure: ToolDisclosure,
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolDisclosure {
+    #[default]
+    Compatible,
+    ResponsesAdditionalTools,
+    ResponsesToolSearch,
+    AnthropicInlineTools,
 }
 impl Default for CompatibilityConfig {
     fn default() -> Self {
@@ -67,6 +77,7 @@ impl Default for CompatibilityConfig {
             system_role: "system".into(),
             responses_store: false,
             reasoning: true,
+            tool_disclosure: ToolDisclosure::Compatible,
         }
     }
 }
@@ -282,6 +293,18 @@ impl ProtocolProvider {
 }
 
 impl Provider for ProtocolProvider {
+    fn input_tokens(&self, context: &Context<'_>) -> u32 {
+        u32::try_from(
+            request_body(&self.config, context)
+                .to_string()
+                .len()
+                .div_ceil(3),
+        )
+        .unwrap_or(u32::MAX)
+    }
+    fn output_reserve(&self) -> u32 {
+        self.config.max_output_tokens
+    }
     fn stream(
         &self,
         context: &Context<'_>,
@@ -319,6 +342,35 @@ impl Provider for ProtocolProvider {
             request = request.set(name, value);
         }
         let body = request_body(&self.config, context);
+        if self.config.protocol == ApiProtocol::Anthropic
+            && (body["messages"]
+                .as_array()
+                .is_some_and(|messages| messages.iter().any(|m| m["role"] == "system"))
+                || body["tools"].as_array().is_some_and(|tools| {
+                    tools
+                        .iter()
+                        .any(|t| t["name"] == "__hikari_deferred_placeholder__")
+                }))
+        {
+            let beta = headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("anthropic-beta"))
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("");
+            request = request.set(
+                "anthropic-beta",
+                &if beta
+                    .split(',')
+                    .any(|value| value.trim() == "inline-tools-2026-09-15")
+                {
+                    beta.to_string()
+                } else if beta.is_empty() {
+                    "inline-tools-2026-09-15".into()
+                } else {
+                    format!("{beta},inline-tools-2026-09-15")
+                },
+            );
+        }
         let mut attempts = 0;
         let response = loop {
             match request.clone().send_json(body.clone()) {
@@ -371,6 +423,36 @@ pub fn endpoint(config: &ProviderConfig) -> String {
 }
 
 pub fn request_body(config: &ProviderConfig, context: &Context<'_>) -> Value {
+    let changes = catalog_changes(context);
+    let latest_matches = context
+        .messages
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            Message::ToolCatalog { tools } => Some(tools.as_slice() == context.tools),
+            _ => None,
+        })
+        .unwrap_or(false);
+    let native = latest_matches
+        && match (config.protocol, config.compatibility.tool_disclosure) {
+            (
+                ApiProtocol::Responses,
+                ToolDisclosure::ResponsesAdditionalTools | ToolDisclosure::ResponsesToolSearch,
+            ) => changes.as_ref().is_some_and(|c| {
+                c.iter().all(|(_, added, removed)| {
+                    removed.is_empty() && added.iter().all(|t| context.tools.contains(t))
+                })
+            }),
+            (ApiProtocol::Anthropic, ToolDisclosure::AnthropicInlineTools) => changes
+                .as_ref()
+                .is_some_and(|c| !c.is_empty() && !c[0].1.is_empty()),
+            _ => false,
+        };
+    let initial = changes
+        .as_ref()
+        .and_then(|c| c.first())
+        .map(|c| c.1.as_slice())
+        .unwrap_or(context.tools);
     match config.protocol {
         ApiProtocol::ChatCompletions => {
             let mut body = crate::openai::request_body(&config.model, context);
@@ -394,8 +476,22 @@ pub fn request_body(config: &ProviderConfig, context: &Context<'_>) -> Value {
         }
         ApiProtocol::Responses => {
             let mut input = Vec::new();
-            for message in context.messages {
+            for (index, message) in context.messages.iter().enumerate() {
                 match message {
+                    Message::ToolCatalog { .. } => {
+                        if native {
+                            if let Some((_, added, _)) = changes.as_ref().unwrap().iter().skip(1).find(|c| c.0 == index) {
+                                if added.is_empty() { continue; }
+                                if config.compatibility.tool_disclosure == ToolDisclosure::ResponsesAdditionalTools {
+                                    input.push(json!({"type":"additional_tools","role":"developer","tools":added.iter().map(|t| responses_tool(t, false)).collect::<Vec<_>>()}));
+                                } else {
+                                    let id = format!("hikari_tool_load_{index}");
+                                    input.push(json!({"type":"tool_search_call","call_id":id,"execution":"client","status":"completed","arguments":{"query":added.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(" "),"limit":added.len()}}));
+                                    input.push(json!({"type":"tool_search_output","call_id":id,"execution":"client","status":"completed","tools":added.iter().map(|t| responses_tool(t, true)).collect::<Vec<_>>()}));
+                                }
+                            }
+                        }
+                    },
                     Message::User { text, .. } => input.push(json!({"role":"user","content":text})),
                     Message::Assistant { text, tool_calls, provider_metadata, .. } => {
                         if let Some(meta) = provider_metadata.as_ref().filter(|m| m.protocol == "responses") {
@@ -420,12 +516,11 @@ pub fn request_body(config: &ProviderConfig, context: &Context<'_>) -> Value {
             if !config.compatibility.reasoning {
                 body.as_object_mut().unwrap().remove("include");
             }
-            if !context.tools.is_empty() {
-                body["tools"] = json!(context
-                    .tools
+            let tools = if native { initial } else { context.tools };
+            if !tools.is_empty() {
+                body["tools"] = json!(tools
                     .iter()
-                    .map(|t| json!({"type":"function","name":t.name,
-                    "description":t.description,"parameters":t.parameters,"strict":false}))
+                    .map(|t| responses_tool(t, false))
                     .collect::<Vec<_>>());
             }
             if let Some(effort) = config
@@ -439,8 +534,30 @@ pub fn request_body(config: &ProviderConfig, context: &Context<'_>) -> Value {
         }
         ApiProtocol::Anthropic => {
             let mut messages: Vec<Value> = Vec::new();
-            for message in context.messages {
+            let mut pending = Vec::new();
+            for (index, message) in context.messages.iter().enumerate() {
+                if matches!(message, Message::Assistant { .. }) {
+                    messages.append(&mut pending);
+                }
                 let (role, content) = match message {
+                    Message::ToolCatalog { .. } => {
+                        if native {
+                            if let Some((_, added, removed)) = changes
+                                .as_ref()
+                                .unwrap()
+                                .iter()
+                                .skip(1)
+                                .find(|c| c.0 == index)
+                            {
+                                let mut blocks: Vec<_> = removed.iter().map(|t| json!({"type":"tool_removal","tool":{"type":"tool_reference","name":t.name}})).collect();
+                                blocks.extend(added.iter().map(|t| json!({"type":"tool_addition","tool":{"type":"tool_definition","definition":anthropic_tool(t)}})));
+                                if !blocks.is_empty() {
+                                    pending.push(json!({"role":"system","content":blocks}));
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     Message::User { text, .. } | Message::ContextSummary { text } => {
                         ("user", vec![json!({"type":"text","text":text})])
                     }
@@ -488,16 +605,16 @@ pub fn request_body(config: &ProviderConfig, context: &Context<'_>) -> Value {
                     messages.push(json!({"role":role,"content":content}));
                 }
             }
+            messages.append(&mut pending);
             let mut body = json!({"model":config.model,"system":context.system_prompt,"messages":messages,
                 "stream":true,"max_tokens":config.max_output_tokens});
-            if !context.tools.is_empty() {
-                body["tools"] = json!(context
-                    .tools
-                    .iter()
-                    .map(|t| json!({
-                        "name":t.name,"description":t.description,"input_schema":t.parameters
-                    }))
-                    .collect::<Vec<_>>());
+            let tools = if native { initial } else { context.tools };
+            if !tools.is_empty() {
+                let mut definitions: Vec<_> = tools.iter().map(anthropic_tool).collect();
+                if native {
+                    definitions.push(json!({"name":"__hikari_deferred_placeholder__","description":"Reserved placeholder. Never call.","input_schema":{"type":"object","properties":{}},"defer_loading":true}));
+                }
+                body["tools"] = json!(definitions);
             }
             if let Some(effort) = config
                 .reasoning_effort
@@ -512,6 +629,50 @@ pub fn request_body(config: &ProviderConfig, context: &Context<'_>) -> Value {
             body
         }
     }
+}
+
+fn responses_tool(tool: &crate::provider::ToolDef, deferred: bool) -> Value {
+    let mut definition = json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.parameters,"strict":false});
+    if deferred {
+        definition["defer_loading"] = json!(true);
+    }
+    definition
+}
+
+fn anthropic_tool(tool: &crate::provider::ToolDef) -> Value {
+    json!({"name":tool.name,"description":tool.description,"input_schema":tool.parameters})
+}
+
+fn catalog_changes(
+    context: &Context<'_>,
+) -> Option<
+    Vec<(
+        usize,
+        Vec<crate::provider::ToolDef>,
+        Vec<crate::provider::ToolDef>,
+    )>,
+> {
+    let mut previous: Option<Vec<crate::provider::ToolDef>> = None;
+    let mut changes = Vec::new();
+    for (index, message) in context.messages.iter().enumerate() {
+        let Message::ToolCatalog { tools } = message else {
+            continue;
+        };
+        let old = previous.take().unwrap_or_default();
+        let added = tools
+            .iter()
+            .filter(|tool| old.iter().find(|item| item.name == tool.name) != Some(*tool))
+            .cloned()
+            .collect();
+        let removed = old
+            .iter()
+            .filter(|tool| !tools.iter().any(|item| item.name == tool.name))
+            .cloned()
+            .collect();
+        changes.push((index, added, removed));
+        previous = Some(tools.clone());
+    }
+    (!changes.is_empty()).then_some(changes)
 }
 
 /// Pi-style stateful assembly: stable tool slots, terminal snapshots and native reasoning replay.

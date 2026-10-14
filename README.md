@@ -32,6 +32,8 @@ cargo run
 
 Connect your model provider in Settings. Supports OpenAI Chat Completions, Responses, and Anthropic Messages.
 
+MCP tools are discovered on demand with `tool_search`. Web fetching and paged conversation lookup are built in; enable Tavily, Exa, or Serper search in Settings → 其它提供商. Long tool output can be read further with `artifact_read`.
+
 Memory stays in a local database. Extraction and consolidation use your configured model. No embedding model or extra service required.
 
 <details>

@@ -11,6 +11,7 @@ pub struct ModelMetadata {
     pub supports_images: bool,
     pub context_tokens: u32,
     pub max_output_tokens: u32,
+    pub tool_disclosure: hikari_agent::protocols::ToolDisclosure,
 }
 impl Default for ModelMetadata {
     fn default() -> Self {
@@ -22,6 +23,7 @@ impl Default for ModelMetadata {
             supports_images: false,
             context_tokens: 128_000,
             max_output_tokens: 8192,
+            tool_disclosure: Default::default(),
         }
     }
 }
@@ -32,6 +34,7 @@ impl ModelMetadata {
             supports_thinking: config.reasoning_effort.is_some(),
             context_tokens: config.context_tokens,
             max_output_tokens: config.max_output_tokens,
+            tool_disclosure: config.compatibility.tool_disclosure,
             ..Default::default()
         };
         if let Some(effort) = &config.reasoning_effort {
@@ -93,6 +96,7 @@ impl ProviderProfile {
         self.config.model = model.id.clone();
         self.config.context_tokens = model.context_tokens;
         self.config.max_output_tokens = model.max_output_tokens;
+        self.config.compatibility.tool_disclosure = model.tool_disclosure;
         if !model.supports_thinking
             || self
                 .config

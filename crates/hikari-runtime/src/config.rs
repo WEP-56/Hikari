@@ -21,6 +21,7 @@ pub struct AppConfig {
     pub mcp_servers: Vec<McpServerConfig>,
     pub skill_roots: Vec<PathBuf>,
     pub disabled_skills: Vec<PathBuf>,
+    pub web: crate::web::WebConfig,
 }
 impl Default for AppConfig {
     fn default() -> Self {
@@ -41,6 +42,7 @@ impl Default for AppConfig {
             mcp_servers: Vec::new(),
             skill_roots: vec![PathBuf::from(".hikari/skills")],
             disabled_skills: Vec::new(),
+            web: Default::default(),
         }
     }
 }
@@ -78,6 +80,7 @@ impl AppConfig {
         {
             model.context_tokens = self.provider.context_tokens;
             model.max_output_tokens = self.provider.max_output_tokens;
+            model.tool_disclosure = self.provider.compatibility.tool_disclosure;
         } else {
             profile
                 .models
@@ -102,6 +105,7 @@ impl AppConfig {
         self.provider.validate()?;
         self.appearance.validate()?;
         self.memory.validate()?;
+        self.web.validate().map_err(AgentError::new)?;
         for reference in [&self.memory.extraction, &self.memory.consolidation] {
             if !reference.provider_id.is_empty()
                 && !self.providers.iter().any(|p| {

@@ -4,9 +4,16 @@
 
 ## 当前状态
 
-更新于 2026-10-13。第一阶段已完成基础 agent、设置和桌面会话交互，已完成 Hindsight 风格 Memory Core、全局角色卡、桌面设置接入及设置页分组整理，进入真实模型与 GPUI 手工验收阶段。
+更新于 2026-10-14。基础 agent、设置、桌面会话、Memory Core 和全局角色卡已接入。本轮按 roadmap 第一批补强工具发现、Web、历史检索、输出续读和完整请求预算，真实提供商验收仍待进行。
 
 已完成：
+
+- MCP 工具按需加载，加载状态随会话保存和压缩恢复；每轮刷新 tools/list、远程调用前核对撤回/参数重定义。新工具下一轮进入目录，暂不依赖 list_changed 即时改写运行中目录。
+- Responses / Messages 可选增量披露，模型设置默认兼容；Messages 发送 inline-tools beta，Responses 移除和重定义回退完整当前定义。`tool_search` 仍是普通本地函数，协议增量记录参照 Pi。
+- Web 搜索适配 Tavily / Exa / Serper，增加“其它提供商”；web_fetch 提取 HTML 正文、保留来源，响应最多 2 MB。三家独立保存密钥、环境变量和地址及各自表单草稿，搜索使用当前选中的一家；旧共用配置迁移到原选中的提供商。公共超时 1–120 秒，阻塞 HTTP 取消受超时约束，不自动重试付费搜索。
+- session_search / session_read 支持来源及分页，当前会话或全局关闭记忆时不提供跨会话检索；过滤关闭记忆的其它会话、suppression 来源和召回派生消息，同步 UI transcript 与 context 的来源。包含遮蔽/召回内容的标题隐藏，防止从标题重新取回遗忘内容；记忆库不可用时返回错误，避免遗漏 suppression 检查。
+- 长输出保存到 `.hikari/artifacts/talk-{id}/{sha256}.txt`，artifact_read 每页最多 12000 个 Unicode 字符；会话删除成功后清理普通 artifact 文件，链接目录或未知文件保留并提示。shell 每流捕获最多 8 MB，超出部分不保存。
+- 完整协议 body 估算预算包含 system、角色卡、Skill、MCP 目录、当轮召回、schema 和消息并预留最大输出。摘要也检查预算；超限保留原文并停止。当前按字节估算，尚未接入模型 tokenizer 或验证真实缓存命中。
 
 - GPUI 桌面应用已经从 `preview` 迁移到 `crates/hikari`。
 - 根目录是 Cargo workspace，默认启动目标是 `crates/hikari`。
@@ -45,7 +52,7 @@ cargo test -p hikari chat_ui_interactions -- --ignored --nocapture
 git diff --check
 ```
 
-本轮共通过 73 项自动测试，另单独通过 1 项 GPUI 事件交互测试。GPUI 测试使用隔离的 `target/chat-test-data`，覆盖深浅色主题、Markdown、折叠、输入框扩展/滚动、工作区隔离、终端切换、草稿、会话管理、密钥保存恢复，以及记忆设置/管理、角色卡编辑与预览、界面/MCP/Skill 设置折叠展开与收起。Windows GPUI 后端不支持 `render_to_image`，未生成像素截图；真实界面效果与手动交互由用户验收。测试使用本地 HTTP / stdio fixture，不调用付费模型；真实模型网关和实际 MCP 服务仍需验收。聊天展示细节见 [chat-ui.md](chat-ui.md)。
+本轮通过 90 项自动测试，另单独通过 1 项 GPUI 事件交互测试，包含新增的 tool-search、协议披露、Web、历史和 artifact 验收。GPUI 测试使用隔离的 `target/chat-test-data`，覆盖深浅色主题、Markdown、折叠、输入框扩展/滚动、工作区隔离、终端切换、草稿、会话管理、密钥与模型工具披露模式保存恢复、三家 Web 搜索提供商切换时的独立草稿及配置保存恢复，以及记忆设置/管理、角色卡编辑与预览、界面/MCP/Skill 设置折叠展开与收起。Windows GPUI 后端不支持 `render_to_image`，未生成像素截图；真实界面效果与手动交互由用户验收。测试使用本地 HTTP / stdio fixture，不调用付费模型；真实模型网关和实际 MCP 服务仍需验收。聊天展示细节见 [chat-ui.md](chat-ui.md)。
 
 ## 目录速览
 
@@ -71,6 +78,7 @@ git diff --check
 .hikari/AGENTS.md
 .hikari/chat/
 .hikari/skills/
+.hikari/artifacts/talk-{id}/
 ```
 
 API key 按提供商明文写入本地配置；空值使用环境变量，设置恢复操作也恢复保存的密钥。窗口图标和头像属于前端资源，不放在根目录或通用 `assets` 中。
@@ -111,6 +119,8 @@ Compaction 不能代替 retain。压缩前必须先提交尚未 retain 的消息
 ```
 
 ## 下一阶段：模型与产品验收
+
+Harness 下一批按 [roadmap](../roadmap.md) 实现会话内执行底座、todo_list、clarify、process_manage 和权限门；之后再做 delegate、附件/图片与 skill_manage，cron 后置。当前 tool-search 的可见性检查不构成执行权限控制。默认兼容模式适用于三种协议；真实原生字段、缓存命中与付费 Web 质量需使用实际模型/网关验证。
 
 代码闭环和本地 fixture 已完成，后续工作集中在真实模型网关质量：验证明确偏好/纠正的抽取、experience 的成功与失败边界、跨会话召回、工具补查、遗忘后的不回填，以及中文表达换词时的可接受漏召回率。辅助模型配置缺失时应在设置页显示失败状态，不静默退化成 NullMemory。
 

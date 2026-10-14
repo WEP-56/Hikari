@@ -393,6 +393,7 @@ fn chat_ui_interactions() {
                 });
                 checkpoint(window,cx,"memory manager");
                 for (section, name) in [
+                    (crate::Section::OtherProviders, "other providers"),
                     (crate::Section::Appearance, "appearance"),
                     (crate::Section::Skill, "skills"),
                     (crate::Section::Mcp, "mcp"),
@@ -402,6 +403,57 @@ fn chat_ui_interactions() {
                     view.update(cx, |app,cx| { app.section=section; app.management_notice.clear(); cx.notify(); });
                     checkpoint(window,cx,name);
                 }
+                view.update(cx, |app,cx| { app.section=crate::Section::OtherProviders; cx.notify(); });
+                checkpoint(window,cx,"web search providers");
+                use hikari_runtime::web::SearchProvider;
+                for provider in SearchProvider::ALL {
+                    window.click(&format!("web-{provider:?}"),cx);
+                    assert_eq!(view.read(cx).config.web.provider,provider);
+                    view.update(cx, |app,cx| {
+                        let draft = &app.settings_draft.web_profiles[provider.index()];
+                        draft.key.update(cx,|state,cx|state.set_value(format!("fixture-{provider:?}"),window,cx));
+                        draft.env.update(cx,|state,cx|state.set_value(format!("FIXTURE_{provider:?}"),window,cx));
+                        draft.endpoint.update(cx,|state,cx|state.set_value(format!("https://example.com/{provider:?}"),window,cx));
+                        cx.notify();
+                    });
+                    checkpoint(window,cx,"provider independent draft");
+                }
+                for provider in SearchProvider::ALL {
+                    window.click(&format!("web-{provider:?}"),cx);
+                    let draft = &view.read(cx).settings_draft.web_profiles[provider.index()];
+                    assert_eq!(draft.key.read(cx).value().as_ref(),format!("fixture-{provider:?}"));
+                    assert_eq!(draft.env.read(cx).value().as_ref(),format!("FIXTURE_{provider:?}"));
+                    assert_eq!(draft.endpoint.read(cx).value().as_ref(),format!("https://example.com/{provider:?}"));
+                    checkpoint(window,cx,"provider draft retained after switching");
+                }
+                window.click("web-Exa",cx);
+                view.update(cx, |app,cx| {
+                    app.config.web.enabled=true;
+                    app.save_config(cx);
+                    assert!(!app.settings_dirty);
+                    let saved=app.config_store.load().unwrap();
+                    assert!(saved.web.enabled);
+                    assert_eq!(saved.web.provider,hikari_runtime::web::SearchProvider::Exa);
+                    for provider in SearchProvider::ALL {
+                        let profile = saved.web.profile(provider);
+                        assert_eq!(profile.api_key,format!("fixture-{provider:?}"));
+                        assert_eq!(profile.api_key_env,format!("FIXTURE_{provider:?}"));
+                        assert_eq!(profile.endpoint,format!("https://example.com/{provider:?}"));
+                        let draft = &app.settings_draft.web_profiles[provider.index()];
+                        for state in [&draft.key, &draft.env, &draft.endpoint] {
+                            state.update(cx,|state,cx|state.set_value("",window,cx));
+                        }
+                    }
+                    app.config.web.provider=SearchProvider::Serper;
+                    app.discard_settings(window,cx);
+                    assert_eq!(app.config.web.provider,SearchProvider::Exa);
+                    for provider in SearchProvider::ALL {
+                        let draft = &app.settings_draft.web_profiles[provider.index()];
+                        assert_eq!(draft.key.read(cx).value().as_ref(),format!("fixture-{provider:?}"));
+                        assert_eq!(draft.env.read(cx).value().as_ref(),format!("FIXTURE_{provider:?}"));
+                        assert_eq!(draft.endpoint.read(cx).value().as_ref(),format!("https://example.com/{provider:?}"));
+                    }
+                });
                 view.update(cx, |app,cx| { app.section=crate::Section::Appearance; cx.notify(); });
                 window.click("fold-appearance-code",cx);
                 assert!(view.read(cx).settings_open.contains("appearance-code"));

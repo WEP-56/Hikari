@@ -264,6 +264,83 @@ fn gateway_compatibility_changes_wire_fields_and_reasoning() {
 }
 
 #[test]
+fn initial_inline_tools_request_already_sends_merged_beta_header() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut headers = Vec::new();
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            headers.push(line.to_lowercase());
+        }
+        let mut bytes = vec![0; length];
+        reader.read_exact(&mut bytes).unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(!body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == "system"));
+        assert!(body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["defer_loading"] == true));
+        assert!(headers
+            .iter()
+            .any(|h| h == "anthropic-beta: existing-beta,inline-tools-2026-09-15\r\n"));
+        let data = "data: {\"type\":\"message_stop\"}\n\n";
+        write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}",data.len()).unwrap();
+    });
+    let mut config = ProviderConfig {
+        protocol: ApiProtocol::Anthropic,
+        base_url: format!("http://{address}/v1"),
+        ..Default::default()
+    };
+    config
+        .headers
+        .insert("anthropic-beta".into(), "existing-beta".into());
+    config.compatibility.tool_disclosure =
+        hikari_agent::protocols::ToolDisclosure::AnthropicInlineTools;
+    let provider = ProtocolProvider::new(config, "").unwrap();
+    let tools = vec![hikari_agent::ToolDef {
+        name: "tool_search".into(),
+        description: "search".into(),
+        parameters: json!({"type":"object"}),
+    }];
+    let messages = vec![
+        Message::ToolCatalog {
+            tools: tools.clone(),
+        },
+        Message::user("hi"),
+    ];
+    provider
+        .stream(
+            &Context {
+                system_prompt: "base",
+                messages: &messages,
+                tools: &tools,
+            },
+            &AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .unwrap();
+    server.join().unwrap();
+}
+
+#[test]
 fn model_discovery_uses_endpoint_headers_auth_and_anthropic_pagination() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();

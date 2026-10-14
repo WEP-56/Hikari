@@ -12,6 +12,7 @@ pub mod pi;
 pub mod protocols;
 pub mod provider;
 pub mod tool;
+pub mod tool_search;
 pub mod transport;
 
 pub use agent::{

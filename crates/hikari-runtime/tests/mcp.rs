@@ -13,7 +13,8 @@ fn streamable_http_session_pagination_tool_error_and_disconnect() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let captured = seen.clone();
     let server = std::thread::spawn(move || {
-        for _ in 0..7 {
+        let mut calls = 0;
+        for _ in 0..13 {
             let (mut stream, _) = listener.accept().unwrap();
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -54,6 +55,7 @@ fn streamable_http_session_pagination_tool_error_and_disconnect() {
                 Some("initialize") => {
                     json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}})
                 }
+                Some("tools/list") if calls >= 2 => json!({"tools":[]}),
                 Some("tools/list") if body["params"].get("cursor").is_none() => {
                     json!({"tools":[{"name":"echo","description":"echo","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}],"nextCursor":"page-2"})
                 }
@@ -62,6 +64,7 @@ fn streamable_http_session_pagination_tool_error_and_disconnect() {
                     json!({"tools":[{"name":"fail","inputSchema":{"type":"object"}}]})
                 }
                 Some("tools/call") => {
+                    calls += 1;
                     if body["params"]["name"] == "echo" {
                         json!({"content":[{"type":"text","text":body["params"]["arguments"]["text"]}],"structuredContent":{"ok":true}})
                     } else {
@@ -115,6 +118,13 @@ fn streamable_http_session_pagination_tool_error_and_disconnect() {
     let mut tools = ToolRegistry::empty();
     manager.register(&mut tools).unwrap();
     assert!(tools
+        .call("mcp_fixture_echo", "{}")
+        .unwrap_err()
+        .contains("尚未加载"));
+    tools
+        .call("tool_search", r#"{"query":"echo fail"}"#)
+        .unwrap();
+    assert!(tools
         .call("mcp_fixture_echo", r#"{"text":"你好"}"#)
         .unwrap()
         .contains("你好"));
@@ -122,6 +132,14 @@ fn streamable_http_session_pagination_tool_error_and_disconnect() {
         .call("mcp_fixture_fail", "{}")
         .unwrap_err()
         .contains("tool failure"));
+    manager.reconcile(&[config], std::env::temp_dir().as_path());
+    let mut refreshed = ToolRegistry::empty();
+    manager.register(&mut refreshed).unwrap();
+    assert!(refreshed.defs().is_empty());
+    assert!(tools
+        .call("mcp_fixture_echo", "{}")
+        .unwrap_err()
+        .contains("已撤回"));
     manager.disconnect("fixture");
     assert!(tools.call("mcp_fixture_echo", "{}").is_err());
     server.join().unwrap();
@@ -132,8 +150,14 @@ fn streamable_http_session_pagination_tool_error_and_disconnect() {
             "notifications/initialized",
             "tools/list",
             "tools/list",
+            "tools/list",
+            "tools/list",
             "tools/call",
+            "tools/list",
+            "tools/list",
             "tools/call",
+            "tools/list",
+            "tools/list",
             "DELETE"
         ]
     );
@@ -181,6 +205,7 @@ while ($null -ne ($line = [Console]::ReadLine())) {
     manager.connect(&config, temp.path()).unwrap();
     let mut tools = ToolRegistry::empty();
     manager.register(&mut tools).unwrap();
+    tools.call("tool_search", r#"{"query":"echo"}"#).unwrap();
     assert_eq!(
         tools
             .call("mcp_local_echo", r#"{"text":"hikari fixture"}"#)
@@ -192,6 +217,9 @@ while ($null -ne ($line = [Console]::ReadLine())) {
     manager.reconcile(&[config], &next_workspace);
     let mut next_tools = ToolRegistry::empty();
     manager.register(&mut next_tools).unwrap();
+    next_tools
+        .call("tool_search", r#"{"query":"echo"}"#)
+        .unwrap();
     let cwd = next_tools
         .call("mcp_local_echo", r#"{"text":"__cwd"}"#)
         .unwrap();
