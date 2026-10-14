@@ -321,7 +321,16 @@ impl Preview {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.running_talk == Some(id) {
+        if self.running_talk == Some(id)
+            || self.talks.iter().find(|t| t.id == id).is_some_and(|t| {
+                t.turn.is_some()
+                    || t.execution
+                        .snapshot()
+                        .tasks
+                        .iter()
+                        .any(|task| !task.status.terminal())
+            })
+        {
             return;
         }
         let Some(index) = self.talks.iter().position(|t| t.id == id) else {

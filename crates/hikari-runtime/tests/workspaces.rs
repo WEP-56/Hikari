@@ -40,6 +40,7 @@ fn old_sessions_load_without_workspace_or_pin_metadata() {
         context_base: 0,
         memory_enabled: true,
         usage: Usage::default(),
+        execution: Default::default(),
     };
     let mut old = serde_json::to_value(session).unwrap();
     old.as_object_mut().unwrap().remove("workspace");

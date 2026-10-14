@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize)]
@@ -136,6 +137,43 @@ struct LoadSkill {
     skills: Vec<Skill>,
 }
 impl Tool for LoadSkill {
+    fn target_path(&self, arguments: &str) -> std::result::Result<Option<PathBuf>, String> {
+        let args: Value = serde_json::from_str(arguments).map_err(|e| e.to_string())?;
+        let skill = self
+            .skills
+            .iter()
+            .find(|s| Some(s.name.as_str()) == args["name"].as_str())
+            .ok_or("Skill 不存在或未启用")?;
+        let base = skill.path.parent().ok_or("Skill 目录不存在")?;
+        let path = args["resource"].as_str().map_or_else(
+            || Ok(skill.path.clone()),
+            |resource| {
+                base.join(resource)
+                    .canonicalize()
+                    .map_err(|e| e.to_string())
+            },
+        )?;
+        if !path.starts_with(base) {
+            return Err("资源路径超出 Skill 目录".into());
+        }
+        Ok(Some(path))
+    }
+    fn call_authorized(
+        &self,
+        arguments: &str,
+        abort: &AtomicBool,
+        target: Option<&std::path::Path>,
+    ) -> std::result::Result<String, String> {
+        if abort.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("已取消".into());
+        }
+        if let Some(target) = target {
+            if self.target_path(arguments)?.as_deref() != Some(target) {
+                return Err("Skill 资源目标已改变，需要重新审批".into());
+            }
+        }
+        self.call(arguments)
+    }
     fn output_limit(&self) -> usize {
         128 * 1024
     }

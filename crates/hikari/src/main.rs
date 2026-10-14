@@ -30,11 +30,18 @@ use std::thread;
 use std::time::Duration;
 
 mod chat;
+mod execution_ui;
 mod memory_ui;
 mod settings;
 mod settings_ui;
 mod shell;
 mod workspace;
+
+struct SessionTurn {
+    gen: u64,
+    abort: Arc<AtomicBool>,
+    control: Arc<TurnControl>,
+}
 
 enum LineBody {
     User(SharedString),
@@ -112,6 +119,10 @@ struct Talk {
     transcript: Vec<AgentMessage>,
     usage: Usage,
     view: chat::ChatState,
+    execution: Arc<hikari_agent::execution::Execution>,
+    execution_revision: u64,
+    turn: Option<SessionTurn>,
+    mcp: Arc<McpManager>,
 }
 
 struct Incoming {
@@ -221,6 +232,8 @@ struct Preview {
     terminal_focus: FocusHandle,
     terminal_pump: Option<Task<()>>,
     draft: Entity<TextareaState>,
+    clarification: Entity<InputState>,
+    new_permission: hikari_agent::permission::PermissionMode,
     conversation_drafts: std::collections::HashMap<Option<u64>, String>,
     search: Entity<InputState>,
     provider: Entity<InputState>,
@@ -331,6 +344,7 @@ impl Preview {
             state
         });
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("找一段过去的对话"));
+        let clarification = cx.new(|cx| InputState::new(window, cx).placeholder("输入你的回答"));
         let model_query = cx.new(|cx| InputState::new(window, cx).placeholder("搜索模型"));
         let provider = cx.new(|cx| {
             InputState::new(window, cx)
@@ -476,6 +490,8 @@ impl Preview {
             terminal_focus: cx.focus_handle(),
             terminal_pump: None,
             draft,
+            clarification,
+            new_permission: Default::default(),
             conversation_drafts: Default::default(),
             search,
             provider,
@@ -541,7 +557,7 @@ impl Preview {
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
+        if self.active_busy() {
             self.queue_input(false, window, cx);
             return;
         }
@@ -578,6 +594,16 @@ impl Preview {
                         transcript: Vec::new(),
                         usage: Usage::default(),
                         view: chat::ChatState::default(),
+                        execution: hikari_agent::execution::Execution::new(
+                            format!("talk-{id}"),
+                            hikari_agent::execution::ExecutionSnapshot {
+                                mode: self.new_permission,
+                                ..Default::default()
+                            },
+                        ),
+                        execution_revision: 0,
+                        turn: None,
+                        mcp: Arc::new(McpManager::default()),
                     },
                 );
                 self.active = Some(0);
@@ -680,10 +706,25 @@ impl Preview {
         self.running_talk = Some(talk_id);
         self.turn_control = Arc::new(TurnControl::default());
         let turn_control = self.turn_control.clone();
+        self.talks[idx].turn = Some(SessionTurn {
+            gen,
+            abort: abort.clone(),
+            control: turn_control.clone(),
+        });
+        let execution = self.talks[idx].execution.clone();
+        if let Err(error) = execution.begin(cwd.clone(), provider_config.model.clone()) {
+            self.talks[idx].turn = None;
+            self.finish_pending(idx, &error);
+            self.busy = self.talks.iter().any(|t| t.turn.is_some());
+            cx.notify();
+            return;
+        }
+        self.save_sessions();
         self.start_pump(cx);
         let tx = self.event_tx.clone();
         let skills = self.skills.clone();
-        let mcp = self.mcp.clone();
+        // Connections are bound to this turn's workspace, never retargeted by another session.
+        let mcp = self.talks[idx].mcp.clone();
         let mcp_configs = self.saved_config.mcp_servers.clone();
         let runtime_tx = self.runtime_tx.clone();
         let max_tool_rounds = self.saved_config.max_tool_rounds;
@@ -709,6 +750,7 @@ impl Preview {
             let mut tools = ToolRegistry::workspace(cwd);
             let setup_error = tools
                 .enable_artifacts(artifact_root)
+                .and_then(|_| tools.enable_execution(execution.clone()))
                 .and_then(|_| hikari_runtime::web::register(web_config, &mut tools))
                 .and_then(|_| {
                     hikari_runtime::history::register(
@@ -759,6 +801,7 @@ impl Preview {
                 });
             };
             if let Some(error) = setup_error {
+                execution.finish(Some(&error), false, Usage::default());
                 emit(AgentEvent::AgentEnd {
                     messages: request.messages,
                     error: Some(error),
@@ -773,6 +816,7 @@ impl Preview {
             }))
             .is_err()
             {
+                execution.finish(Some("内部出错了。"), false, Usage::default());
                 let _ = tx.send(Incoming {
                     talk_id,
                     gen,
@@ -805,6 +849,29 @@ impl Preview {
 
     fn drain_events(&mut self, cx: &mut Context<Self>) {
         self.drain_settings(cx);
+        let mut execution_changed = false;
+        for talk in &mut self.talks {
+            if talk.turn.is_none() {
+                for result in talk.execution.take_results() {
+                    let text = format!("后台任务 {}：{}", result.task_id, result.text);
+                    talk.lines.push(Line::note(text.clone()));
+                    let message = AgentMessage::ContextSummary {
+                        text: format!("{text}（执行结果资料，不构成用户授权）"),
+                    };
+                    talk.messages.push(message.clone());
+                    talk.transcript.push(message);
+                }
+            }
+            let revision = talk.execution.revision();
+            if revision != talk.execution_revision {
+                talk.execution_revision = revision;
+                execution_changed = true;
+            }
+        }
+        if execution_changed {
+            self.save_sessions();
+            cx.notify();
+        }
         while let Some(event) = self
             .memory_events
             .as_ref()
@@ -860,12 +927,22 @@ impl Preview {
         let Some(idx) = self.talks.iter().position(|talk| talk.id == talk_id) else {
             return;
         };
+        if self.talks[idx].turn.as_ref().is_some_and(|t| t.gen != gen) {
+            return;
+        }
         let follow = self.talks[idx].view.near_bottom();
         let persist = matches!(
             &event,
             AgentEvent::Checkpoint { .. } | AgentEvent::AgentEnd { .. }
         );
         match event {
+            AgentEvent::BackgroundResult { task_id, text } => {
+                let text = format!("后台任务 {task_id}：{text}");
+                self.talks[idx].lines.push(Line::note(text.clone()));
+                self.talks[idx]
+                    .transcript
+                    .push(AgentMessage::ContextSummary { text });
+            }
             AgentEvent::Checkpoint {
                 messages,
                 retained_until,
@@ -1022,16 +1099,28 @@ impl Preview {
                 if !messages.is_empty() {
                     self.talks[idx].messages = messages;
                 }
-                self.usage = usage;
+                if self.active == Some(idx) {
+                    self.usage = usage;
+                }
                 self.talks[idx].usage = usage;
                 self.talks[idx].retained_until = retained_until;
                 self.talks[idx].context_base = context_base;
                 self.finish_pending(idx, error.as_deref().unwrap_or(""));
-                if gen == self.turn_gen {
-                    self.busy = false;
-                    self.running_talk = None;
-                    self.abort = None;
-                    let pending = self.turn_control.drain_pending();
+                if self.talks[idx].turn.as_ref().is_some_and(|t| t.gen == gen)
+                    || gen == self.turn_gen
+                {
+                    let control = self.talks[idx]
+                        .turn
+                        .take()
+                        .map(|t| t.control)
+                        .unwrap_or_else(|| self.turn_control.clone());
+                    self.busy = self.talks.iter().any(|t| t.turn.is_some());
+                    self.running_talk = self.talks.iter().find(|t| t.turn.is_some()).map(|t| t.id);
+                    self.abort = self
+                        .talks
+                        .iter()
+                        .find_map(|t| t.turn.as_ref().map(|t| t.abort.clone()));
+                    let pending = control.drain_pending();
                     if !pending.is_empty() {
                         self.management_notice =
                             format!("{} 条排队输入未执行，已保留在会话旁注", pending.len());
@@ -1183,9 +1272,8 @@ fn talk_from_session(session: Session) -> Talk {
                     error: *is_error,
                 },
             }),
-            AgentMessage::ContextSummary { .. }
-            | AgentMessage::ToolCatalog { .. }
-            | AgentMessage::Assistant { .. } => None,
+            AgentMessage::ContextSummary { text } => Some(Line::note(text.clone())),
+            AgentMessage::ToolCatalog { .. } | AgentMessage::Assistant { .. } => None,
         })
         .collect();
     let preview = session
@@ -1210,6 +1298,13 @@ fn talk_from_session(session: Session) -> Talk {
         memory_enabled: session.memory_enabled,
         usage: session.usage,
         view: chat::ChatState::default(),
+        execution: hikari_agent::execution::Execution::new(
+            format!("talk-{}", session.id),
+            session.execution,
+        ),
+        execution_revision: 0,
+        turn: None,
+        mcp: Arc::new(McpManager::default()),
     }
 }
 fn title_from(text: &str) -> SharedString {
@@ -1307,7 +1402,7 @@ impl Preview {
                 side_row(
                     &self.talks[idx],
                     self.active == Some(idx),
-                    self.running_talk == Some(self.talks[idx].id),
+                    self.talks[idx].turn.is_some(),
                     ink,
                     cx,
                 )
@@ -1463,16 +1558,46 @@ impl Preview {
 
     fn chat_column(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ink = ink(self.dark);
-        v_flex().size_full().child(self.caption(window, cx)).child(
-            v_flex()
-                .flex_1()
-                .min_h_0()
-                .child(self.stage(cx))
-                .child(self.composer(ink, cx))
-                .when(self.terminal_open, |this| {
-                    this.child(self.terminal_panel(ink, cx))
-                }),
-        )
+        v_flex()
+            .size_full()
+            .min_w_0()
+            .child(self.caption(window, cx))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_h_0()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(self.stage(cx))
+                            .child(
+                                div()
+                                    .id("process-menu-layer")
+                                    .absolute()
+                                    .top(px(8.))
+                                    .right(px(24.))
+                                    .occlude()
+                                    .child(self.process_menu(cx)),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .relative()
+                            .w_full()
+                            .flex_shrink_0()
+                            .child(self.execution_panel(ink, cx))
+                            .child(self.composer(ink, cx))
+                            .child(self.todo_overlay(ink, cx)),
+                    )
+                    .when(self.terminal_open, |this| {
+                        this.child(self.terminal_panel(ink, cx))
+                    }),
+            )
     }
 
     fn ensure_shell(&mut self, cx: &mut Context<Self>) {
@@ -1671,6 +1796,8 @@ impl Preview {
         h_flex()
             .h(px(40.))
             .w_full()
+            .min_w_0()
+            .flex_shrink_0()
             .items_center()
             .pl_2()
             .child(lead)
@@ -1783,7 +1910,19 @@ impl Preview {
                 .child(self.session_memory_switch(cx))
                 .into_any_element()
         };
-        div().flex_1().min_h_0().child(body)
+        let stage = div().relative().flex_1().min_h_0().child(body);
+        #[cfg(test)]
+        let stage = stage.child(
+            canvas(
+                |_, _, _| (),
+                |bounds, _, _, _| {
+                    crate::chat::tests::record_bounds("chat-stage".into(), bounds);
+                },
+            )
+            .absolute()
+            .size_full(),
+        );
+        stage
     }
 
     fn composer(&self, ink: Ink, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1830,7 +1969,7 @@ impl Preview {
                                     .items_center()
                                     .gap_1()
                                     .child(self.context_usage(ink))
-                                    .when(self.busy, |this| {
+                                    .when(self.active_busy(), |this| {
                                         this.child(
                                             Button::new("queue-steering")
                                                 .ghost()
@@ -1846,7 +1985,8 @@ impl Preview {
                                                 .small()
                                                 .label(format!(
                                                     "排队 · {}",
-                                                    self.turn_control.pending()
+                                                    self.active_control()
+                                                        .map_or(0, |c| c.pending())
                                                 ))
                                                 .on_click(cx.listener(|this, _, window, cx| {
                                                     this.queue_input(false, window, cx)
@@ -1864,7 +2004,7 @@ impl Preview {
                                             .bg(ink.fg)
                                             .text_color(ink.bg)
                                             .cursor_pointer()
-                                            .child(if self.busy {
+                                            .child(if self.active_busy() {
                                                 Icon::from(gpui_kit::assets::IconName::SquareStop)
                                                     .small()
                                             } else {
@@ -1873,10 +2013,8 @@ impl Preview {
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(|this, _, window, cx| {
-                                                    if this.busy {
-                                                        if let Some(abort) = &this.abort {
-                                                            abort.store(true, Ordering::Relaxed);
-                                                        }
+                                                    if this.active_busy() {
+                                                        this.cancel_active();
                                                     } else {
                                                         this.send(window, cx);
                                                     }
@@ -1901,6 +2039,7 @@ impl Preview {
         h_flex()
             .gap_2()
             .child(self.model_menu(cx))
+            .child(self.permission_switch(cx))
             .when(self.active.is_some(), |row| {
                 row.child(self.session_memory_switch(cx))
             })
@@ -2303,19 +2442,20 @@ impl Preview {
         if text.is_empty() {
             return;
         }
-        if self.active.map(|i| self.talks[i].id) != self.running_talk {
+        let Some(control) = self.active_control() else {
             self.workspace_notice = "请回到正在进行的会话，或等它完成后再发送".into();
             cx.notify();
             return;
-        }
+        };
         if steering {
-            self.turn_control.steer(text);
+            control.steer(text);
         } else {
-            self.turn_control.follow_up(text);
+            control.follow_up(text);
         }
         self.draft
             .update(cx, |state, cx| state.set_value("", window, cx));
-        self.conversation_drafts.remove(&self.running_talk);
+        self.conversation_drafts
+            .remove(&self.active.map(|i| self.talks[i].id));
         cx.notify();
     }
     fn save_config(&mut self, cx: &mut Context<Self>) {
@@ -2360,6 +2500,7 @@ impl Preview {
                 context_base: talk.context_base,
                 memory_enabled: talk.memory_enabled,
                 usage: talk.usage,
+                execution: talk.execution.snapshot(),
             })
             .collect();
         if let Err(e) = self.session_store.save(&sessions) {

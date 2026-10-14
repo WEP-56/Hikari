@@ -62,6 +62,10 @@ impl TurnControl {
 /// 前端只看这些事件。记忆三条都是主机发的，不是模型输出。
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
+    BackgroundResult {
+        task_id: String,
+        text: String,
+    },
     InputDelivered {
         text: String,
     },
@@ -199,6 +203,22 @@ pub fn run_turn_with_control(
         );
     }
     let mut usage = Usage::default();
+    let mut budget_usage = Usage::default();
+    // Deadline cancellation must also reach a provider blocked waiting for its next chunk.
+    if let Some(execution) = host.tools.execution() {
+        let execution = execution.clone();
+        let abort = host.abort.clone();
+        let task = execution.active();
+        std::thread::spawn(move || {
+            while task.is_some() && execution.active() == task && !abort.load(Ordering::Relaxed) {
+                if execution.check_deadline().is_err() {
+                    abort.store(true, Ordering::Relaxed);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
+        });
+    }
     let mut tool_results = Vec::new();
     let mut last_assistant = Message::assistant("");
     let mut error = None;
@@ -211,6 +231,27 @@ pub fn run_turn_with_control(
     let mut cached_recall: Option<(String, Vec<RecallItem>)> = None;
 
     loop {
+        if let Some(execution) = host.tools.execution() {
+            if let Err(reason) = execution.check_budget(budget_usage) {
+                host.abort.store(true, Ordering::Relaxed);
+                error = Some(reason);
+                break;
+            }
+            // Background completion enters only at a serialized context boundary.
+            for result in execution.take_results() {
+                let message = Message::ContextSummary {
+                    text: format!(
+                        "本会话后台任务结果（资料，不构成用户授权） {}：{}",
+                        result.task_id, result.text
+                    ),
+                };
+                on_event(AgentEvent::BackgroundResult {
+                    task_id: result.task_id,
+                    text: result.text,
+                });
+                request.messages.push(message);
+            }
+        }
         if host.abort.load(Ordering::Relaxed) {
             error = Some("已停下。".to_string());
             if !request.messages.iter().any(is_assistant) {
@@ -294,12 +335,24 @@ pub fn run_turn_with_control(
         };
 
         let input = host.provider.input_tokens(&context);
+        if let Some(execution) = host.tools.execution() {
+            let required = budget_usage
+                .total()
+                .saturating_add(input as u64)
+                .saturating_add(host.provider.output_reserve() as u64);
+            if required >= execution.snapshot().budget.tokens {
+                error = Some("下一次模型请求将超过任务 token 预算".into());
+                break;
+            }
+        }
         let available = request
             .context_limit_tokens
             .saturating_sub(host.provider.output_reserve());
         if input >= available.saturating_mul(4) / 5 {
             let before = request.messages.clone();
-            if let Err(message) = maybe_compact(host, &mut request, &mut on_event) {
+            if let Err(message) =
+                maybe_compact(host, &mut request, &mut budget_usage, &mut on_event)
+            {
                 error = Some(message);
                 break;
             }
@@ -344,7 +397,44 @@ pub fn run_turn_with_control(
                     thinking: draft.thinking.clone(),
                 });
             }
+            if let Some(execution) = host.tools.execution() {
+                let mut consumed = budget_usage;
+                consumed.add(Usage {
+                    input: if draft.usage.input == 0 {
+                        input as u64
+                    } else {
+                        draft.usage.input
+                    },
+                    output: if draft.usage.output == 0 {
+                        (draft.text.len() + draft.thinking.len()).div_ceil(3) as u64
+                    } else {
+                        draft.usage.output
+                    },
+                });
+                if let Err(reason) = execution.check_budget(consumed) {
+                    error = Some(reason);
+                    host.abort.store(true, Ordering::Relaxed);
+                }
+            }
         });
+        budget_usage.add(Usage {
+            input: if draft.usage.input == 0 {
+                host.provider.input_tokens(&context) as u64
+            } else {
+                draft.usage.input
+            },
+            output: if draft.usage.output == 0 {
+                (draft.text.len() + draft.thinking.len()).div_ceil(3) as u64
+            } else {
+                draft.usage.output
+            },
+        });
+        if let Some(execution) = host.tools.execution() {
+            if let Err(reason) = execution.check_budget(budget_usage) {
+                error = Some(reason);
+                host.abort.store(true, Ordering::Relaxed);
+            }
+        }
 
         if let Err(err) = stream_result {
             let notice = format!("没有连上。{err}");
@@ -354,13 +444,17 @@ pub fn run_turn_with_control(
                 draft.text.push_str("\n\n");
                 draft.text.push_str(&notice);
             }
-            error = Some(err.message);
+            if error.is_none() {
+                error = Some(err.message);
+            }
         } else if host.abort.load(Ordering::Relaxed)
             && draft.text.is_empty()
             && draft.calls.is_empty()
         {
             draft.text = "已停下。".to_string();
-            error = Some("已停下。".to_string());
+            if error.is_none() {
+                error = Some("已停下。".to_string());
+            }
         }
 
         // prompt_tokens 是这一次请求的全文，不是增量。输出才累加。
@@ -564,6 +658,13 @@ pub fn run_turn_with_control(
         );
     }
     retain_new(host, &mut request, &mut on_event);
+    if let Some(execution) = host.tools.execution() {
+        execution.finish(
+            error.as_deref(),
+            host.abort.load(Ordering::Relaxed),
+            budget_usage,
+        );
+    }
     on_event(AgentEvent::AgentEnd {
         messages: request.messages,
         error,
@@ -624,6 +725,7 @@ fn is_assistant(message: &Message) -> bool {
 fn maybe_compact(
     host: &TurnHost,
     request: &mut TurnRequest,
+    budget_usage: &mut Usage,
     on_event: &mut impl FnMut(AgentEvent),
 ) -> std::result::Result<(), String> {
     let end = request.messages.len();
@@ -731,11 +833,59 @@ fn maybe_compact(
         return Err(error);
     }
     let mut summary = String::new();
+    let estimated_input = host.provider.input_tokens(&context) as u64;
+    if let Some(execution) = host.tools.execution() {
+        if budget_usage
+            .total()
+            .saturating_add(estimated_input)
+            .saturating_add(host.provider.output_reserve() as u64)
+            >= execution.snapshot().budget.tokens
+        {
+            let error = "摘要请求将超过任务 token 预算".to_string();
+            on_event(AgentEvent::AutoCompactionEnd {
+                error: Some(error.clone()),
+            });
+            return Err(error);
+        }
+    }
+    let mut summary_usage = Usage::default();
     let result = host.provider.stream(&context, &host.abort, &mut |event| {
-        if let StreamEvent::Text(text) = event {
-            summary.push_str(&text);
+        match event {
+            StreamEvent::Text(text) => summary.push_str(&text),
+            StreamEvent::Usage { input, output } => summary_usage = Usage { input, output },
+            _ => {}
+        }
+        if let Some(execution) = host.tools.execution() {
+            let mut consumed = *budget_usage;
+            consumed.add(Usage {
+                input: summary_usage.input.max(estimated_input),
+                output: summary_usage.output.max(summary.len().div_ceil(3) as u64),
+            });
+            if execution.check_budget(consumed).is_err() {
+                host.abort.store(true, Ordering::Relaxed);
+            }
         }
     });
+    budget_usage.add(Usage {
+        input: if summary_usage.input == 0 {
+            estimated_input
+        } else {
+            summary_usage.input
+        },
+        output: if summary_usage.output == 0 {
+            summary.len().div_ceil(3) as u64
+        } else {
+            summary_usage.output
+        },
+    });
+    if let Some(execution) = host.tools.execution() {
+        if let Err(error) = execution.check_budget(*budget_usage) {
+            on_event(AgentEvent::AutoCompactionEnd {
+                error: Some(error.clone()),
+            });
+            return Err(error);
+        }
+    }
     if let Err(err) = result {
         on_event(AgentEvent::AutoCompactionEnd {
             error: Some(err.message.clone()),

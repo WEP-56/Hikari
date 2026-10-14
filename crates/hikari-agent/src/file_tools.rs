@@ -56,15 +56,23 @@ impl Tool for FileTool {
         arguments: &str,
         abort: &AtomicBool,
     ) -> std::result::Result<String, String> {
+        self.call_authorized(arguments, abort, None)
+    }
+    fn call_authorized(
+        &self,
+        arguments: &str,
+        abort: &AtomicBool,
+        target: Option<&Path>,
+    ) -> std::result::Result<String, String> {
         let args: Value = serde_json::from_str(arguments).map_err(|e| e.to_string())?;
         let text = |key: &str| args[key].as_str().ok_or_else(|| format!("缺少 {key}"));
-        let path = resolve_inside(&self.root, text("path")?)?;
+        let path = authorized_path(&self.root, text("path")?, target)?;
         if abort.load(Ordering::Relaxed) {
             return Err("已取消".into());
         }
         match self.kind {
             "read" => {
-                let data = read_workspace_file(&self.root, text("path")?)?;
+                let data = read_text_file(&path)?;
                 let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
                 let limit = args["limit"].as_u64().unwrap_or(200).clamp(1, 1000) as usize;
                 Ok(data
@@ -143,6 +151,17 @@ impl Tool for FileTool {
                 while let Some(path) = stack.pop() {
                     if abort.load(Ordering::Relaxed) {
                         return Err("搜索已取消".into());
+                    }
+                    // A junction discovered during traversal must not widen the approved root.
+                    if !crate::permission::resolve_path(&self.root, &path.to_string_lossy())?
+                        .starts_with(
+                            target
+                                .unwrap_or(&self.root)
+                                .canonicalize()
+                                .unwrap_or_else(|_| target.unwrap_or(&self.root).to_owned()),
+                        )
+                    {
+                        continue;
                     }
                     visited += 1;
                     if visited > 20_000 || matches.len() >= 200 {

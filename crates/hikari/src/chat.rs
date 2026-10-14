@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 pub(super) struct ChatState {
     pub scroll: ScrollHandle,
     expanded: BTreeMap<String, bool>,
+    pub(super) todo_open: bool,
+    pub(super) process_open: bool,
     started: Option<(usize, Instant)>,
     elapsed: BTreeMap<usize, Duration>,
 }
@@ -38,6 +40,10 @@ impl ChatState {
     fn toggle(&mut self, id: String, default: bool) {
         let open = self.open(&id, default);
         self.expanded.insert(id, !open);
+    }
+
+    pub(super) fn toggle_todo(&mut self) {
+        self.todo_open = !self.todo_open;
     }
 }
 
@@ -121,7 +127,7 @@ impl Preview {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let talk = &self.talks[idx];
-        let running = self.busy && self.running_talk == Some(talk.id);
+        let running = talk.turn.is_some();
         turn_layouts(&talk.lines, running)
             .into_iter()
             .map(|turn| {

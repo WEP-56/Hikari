@@ -2828,6 +2828,7 @@ dependencies = [
 name = "hikari-agent"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "memchr",
  "serde",
@@ -2836,6 +2837,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

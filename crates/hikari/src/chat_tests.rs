@@ -29,7 +29,7 @@ fn fixture() -> Session {
         ],
         context: vec![], retained_until: 0,
         context_base: 0,
-        memory_enabled: true, usage: Usage::default(),
+        memory_enabled: true, usage: Usage::default(), execution: Default::default(),
     }
 }
 
@@ -499,6 +499,153 @@ fn chat_ui_interactions() {
                 checkpoint(window,cx,"global persona editor");
                 view.update(cx, |app,cx|{app.persona_preview=true;cx.notify();});
                 checkpoint(window,cx,"global persona Markdown preview");
+                // Render and hit-test the second-batch UI with real session-owned tools.
+                view.update(cx, |app, cx| {
+                    app.settings = false;
+                    app.persona_preview = false;
+                    app.active = Some(0);
+                    app.talks = vec![talk_from_session(fixture())];
+                    app.talks[0].lines.clear();
+                    cx.notify();
+                });
+                window.click("permission-mode", cx);
+                assert_eq!(view.read(cx).talks[0].execution.mode(), hikari_agent::permission::PermissionMode::Autonomous);
+                window.click("permission-mode", cx);
+                let execution = view.read(cx).talks[0].execution.clone();
+                let directory = view.read(cx).agent_directory();
+                std::fs::create_dir_all(&directory).unwrap();
+                execution.begin(directory.clone(), "ui-fixture".into()).unwrap();
+                let mut tools = hikari_agent::ToolRegistry::workspace(&directory);
+                tools.enable_execution(execution.clone()).unwrap();
+                let tools = std::sync::Arc::new(tools);
+                checkpoint(window, cx, "empty execution panel");
+                let empty_input = view.read(cx).draft.read(cx).input_bounds();
+                let empty_stage = BOUNDS.with(|map| map.borrow()["chat-stage"]);
+                assert!(!BOUNDS.with(|map| map.borrow().contains_key("todo-overlay")));
+                tools.call("todo_list", r#"{"action":"replace","items":[{"id":"verify","text":"验证提问与审批","status":"in_progress"}]}"#).unwrap();
+                checkpoint(window, cx, "collapsed floating todo");
+                assert!(!view.read(cx).talks[0].view.todo_open);
+                assert_eq!(view.read(cx).draft.read(cx).input_bounds(), empty_input);
+                assert_eq!(BOUNDS.with(|map| map.borrow()["chat-stage"]), empty_stage,
+                    "Collapsed todos must not reserve chat height");
+                let collapsed_todo = BOUNDS.with(|map| map.borrow()["todo-overlay"]);
+                assert!(collapsed_todo.size.height <= px(40.));
+                assert!(collapsed_todo.bottom() < empty_input.origin.y,
+                    "Todos float above the composer");
+                window.click("todo-toggle", cx);
+                assert!(view.read(cx).talks[0].view.todo_open);
+                let expanded_todo = BOUNDS.with(|map| map.borrow()["todo-overlay"]);
+                assert!(expanded_todo.size.height > collapsed_todo.size.height);
+                assert!(expanded_todo.size.height < px(120.), "A short list stays compact");
+                assert_eq!(view.read(cx).draft.read(cx).input_bounds(), empty_input);
+                assert_eq!(BOUNDS.with(|map| map.borrow()["chat-stage"]), empty_stage,
+                    "Expanded todos must not reserve chat height");
+                let long_todos = serde_json::json!({"action":"replace", "items": (0..30).map(|i|
+                    serde_json::json!({"id": format!("todo-{i}"), "text": format!("待办细则 {i}：验证长列表滚动"), "status":"pending"})
+                ).collect::<Vec<_>>()});
+                tools.call("todo_list", &long_todos.to_string()).unwrap();
+                checkpoint(window, cx, "bounded floating todo details");
+                assert!(BOUNDS.with(|map| map.borrow()["todo-overlay"].size.height) <= px(216.));
+                assert_eq!(BOUNDS.with(|map| map.borrow()["chat-stage"]), empty_stage);
+                view.read(cx).draft.clone().update(cx, |state, cx| state.set_value("第一行\n第二行\n第三行\n第四行\n第五行\n第六行", window, cx));
+                window.render_frame(cx);
+                window.render_frame(cx);
+                let tall_input = view.read(cx).draft.read(cx).input_bounds();
+                assert_eq!(tall_input.bottom(), empty_input.bottom());
+                assert!(BOUNDS.with(|map| map.borrow()["todo-overlay"].bottom()) < tall_input.origin.y,
+                    "The floating list follows a growing composer");
+                window.click("todo-toggle", cx);
+                assert!(!view.read(cx).talks[0].view.todo_open);
+                view.read(cx).draft.clone().update(cx, |state, cx| state.set_value("", window, cx));
+                window.render_frame(cx);
+                window.render_frame(cx);
+                window.click("todo-toggle", cx);
+                assert!(view.read(cx).talks[0].view.todo_open);
+                tools.call("todo_list", r#"{"action":"replace","items":[]}"#).unwrap();
+                checkpoint(window, cx, "cleared todo overlay");
+                assert!(!BOUNDS.with(|map| map.borrow().contains_key("todo-overlay")));
+                assert_eq!(BOUNDS.with(|map| map.borrow()["chat-stage"]), empty_stage);
+                assert_eq!(view.read(cx).draft.read(cx).input_bounds(), empty_input);
+                tools.call("todo_list", r#"{"action":"replace","items":[{"id":"verify","text":"验证提问与审批","status":"in_progress"}]}"#).unwrap();
+                window.click("todo-toggle", cx);
+                assert!(!view.read(cx).talks[0].view.todo_open);
+                let start_waiting = |tool: &str, arguments: &str| {
+                    let tools = tools.clone(); let tool = tool.to_owned(); let arguments = arguments.to_owned();
+                    let worker = std::thread::spawn(move ||tools.call(&tool, &arguments));
+                    let start = std::time::Instant::now();
+                    while execution.pending().is_none() {
+                        assert!(start.elapsed()<Duration::from_secs(5));
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    worker
+                };
+                let worker = start_waiting("clarify", r#"{"question":"选择验证范围","options":["全部","部分"]}"#);
+                checkpoint(window, cx, "todo and clarification");
+                checkpoint(window, cx, "clarification dark");
+                let card = BOUNDS.with(|map| map.borrow()["interaction-card"]);
+                assert!(card.size.width <= px(752.) && card.size.height < px(360.));
+                assert!(card.bottom() < view.read(cx).draft.read(cx).input_bounds().origin.y);
+                view.update(cx, |app, cx| app.set_dark(false, window, cx));
+                checkpoint(window, cx, "clarification light");
+                view.update(cx, |app, cx| app.set_dark(true, window, cx));
+                window.render_frame(cx);
+                assert!(BOUNDS.with(|map| {
+                    let map = map.borrow();
+                    map["todo-overlay"].bottom() < map["clarify-option-0"].origin.y
+                }), "Floating todos must not cover clarification controls");
+                window.click("clarify-option-0", cx);
+                assert!(worker.join().unwrap().unwrap().contains("全部"));
+                let worker = start_waiting("clarify", r#"{"question":"输入补充说明"}"#);
+                view.read(cx).clarification.clone().update(cx, |state,cx|state.set_value("已确认",window,cx));
+                window.click("answer-clarify",cx);
+                assert!(worker.join().unwrap().unwrap().contains("已确认"));
+                let worker = start_waiting("clarify", r#"{"question":"可以拒绝回答"}"#);
+                window.click("reject-clarify",cx);
+                assert!(worker.join().unwrap().unwrap().contains("rejected"));
+                let worker = start_waiting("clarify", r#"{"question":"可以取消提问"}"#);
+                window.click("cancel-clarify",cx);
+                assert!(worker.join().unwrap().unwrap().contains("cancelled"));
+                let worker = start_waiting("shell", r#"{"command":"echo approval > ui-approved.txt"}"#);
+                checkpoint(window, cx, "approval parameters and target");
+                checkpoint(window, cx, "approval dark");
+                assert!(BOUNDS.with(|map| map.borrow()["interaction-card"].size.height) < px(340.));
+                view.update(cx, |app, cx| app.set_dark(false, window, cx));
+                checkpoint(window, cx, "approval light");
+                view.update(cx, |app, cx| app.set_dark(true, window, cx));
+                window.click("reject-action",cx);
+                assert!(worker.join().unwrap().unwrap_err().contains("拒绝"));
+                assert!(!directory.join("ui-approved.txt").exists());
+                let worker = start_waiting("shell", r#"{"command":"echo approval > ui-approved.txt"}"#);
+                window.click("approve-once",cx);
+                assert!(worker.join().unwrap().is_ok());
+                assert!(directory.join("ui-approved.txt").exists());
+                std::fs::remove_file(directory.join("ui-approved.txt")).unwrap();
+                let process = execution.spawn_process(directory.clone(), "ping -n 30 127.0.0.1 > nul".into(), &std::sync::atomic::AtomicBool::new(false)).unwrap();
+                let process_id = serde_json::from_str::<serde_json::Value>(&process).unwrap()["task_id"].as_str().unwrap().to_owned();
+                checkpoint(window, cx, "background process collapsed");
+                assert_eq!(view.read(cx).draft.read(cx).input_bounds(), empty_input,
+                    "Background processes must not take composer space");
+                assert_eq!(BOUNDS.with(|map| map.borrow()["chat-stage"]), empty_stage);
+                assert!(!BOUNDS.with(|map| map.borrow().contains_key("interaction-card")));
+                assert!(BOUNDS.with(|map| map.borrow()["process-menu-toggle"].origin.y) < px(90.));
+                window.click("process-menu-toggle", cx);
+                assert!(view.read(cx).talks[0].view.process_open, "Process trigger must open the popover");
+                window.render_frame(cx);
+                window.render_frame(cx);
+                checkpoint(window, cx, "background process popover");
+                assert!(BOUNDS.with(|map| map.borrow().contains_key("process-popover")));
+                window.click(&format!("stop-{process_id}"), cx);
+                let started = std::time::Instant::now();
+                while execution.snapshot().tasks.iter().any(|task| task.task_id == process_id && !task.status.terminal()) {
+                    assert!(started.elapsed() < Duration::from_secs(5));
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                // Clicking outside dismisses the standard Popover.
+                window.click("permission-mode", cx);
+                assert!(!BOUNDS.with(|map| map.borrow().contains_key("process-popover")));
+                execution.finish(None,false,Usage::default());
+                view.update(cx,|app,cx|{app.save_sessions();cx.notify();});
+                assert_eq!(view.read(cx).session_store.load().unwrap()[0].execution.todos.len(),1);
                 cx.quit();
             }).unwrap();
         }).detach();

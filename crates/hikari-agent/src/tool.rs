@@ -24,6 +24,18 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn parameters(&self) -> Value;
     fn call(&self, arguments: &str) -> std::result::Result<String, String>;
+    fn target_path(&self, _arguments: &str) -> std::result::Result<Option<PathBuf>, String> {
+        Ok(None)
+    }
+    /// Exact resolved target approved by the host; ordinary extension tools ignore it.
+    fn call_authorized(
+        &self,
+        arguments: &str,
+        abort: &AtomicBool,
+        _target: Option<&Path>,
+    ) -> std::result::Result<String, String> {
+        self.call_with_abort(arguments, abort)
+    }
     fn output_limit(&self) -> usize {
         OUTPUT_CAP
     }
@@ -45,6 +57,8 @@ pub struct ToolRegistry {
     deferred: BTreeMap<String, String>,
     loaded: Mutex<Vec<String>>,
     artifacts: Option<PathBuf>,
+    root: Option<PathBuf>,
+    execution: Option<Arc<crate::execution::Execution>>,
 }
 
 impl ToolRegistry {
@@ -63,6 +77,8 @@ impl ToolRegistry {
             deferred: BTreeMap::new(),
             loaded: Mutex::new(Vec::new()),
             artifacts: None,
+            root: None,
+            execution: None,
         }
     }
 
@@ -73,7 +89,8 @@ impl ToolRegistry {
     /// 本机两个工具：在工作区里跑命令，和读工作区里的文本。
     pub fn workspace(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
-        Self::new(vec![
+        let root = root.canonicalize().unwrap_or(root);
+        let mut registry = Self::new(vec![
             Arc::new(ShellTool { root: root.clone() }),
             Arc::new(ReadTool { root: root.clone() }),
             Arc::new(FileTool {
@@ -96,8 +113,25 @@ impl ToolRegistry {
                 root: root.clone(),
                 kind: "find",
             }),
-            Arc::new(FileTool { root, kind: "grep" }),
-        ])
+            Arc::new(FileTool {
+                root: root.clone(),
+                kind: "grep",
+            }),
+        ]);
+        registry.root = Some(root);
+        registry
+    }
+
+    pub fn enable_execution(
+        &mut self,
+        execution: Arc<crate::execution::Execution>,
+    ) -> std::result::Result<(), String> {
+        execution.register(self)?;
+        self.execution = Some(execution);
+        Ok(())
+    }
+    pub fn execution(&self) -> Option<&Arc<crate::execution::Execution>> {
+        self.execution.as_ref()
     }
 
     pub fn defs(&self) -> &[ToolDef] {
@@ -245,7 +279,86 @@ impl ToolRegistry {
             .iter()
             .find(|t| t.name() == name)
             .ok_or_else(|| format!("没有名为 {name} 的工具"))?;
-        tool.call_with_abort(arguments, abort)
+        let mut target = None;
+        if let Some(root) = &self.root {
+            let args: Value = serde_json::from_str(arguments).map_err(|e| e.to_string())?;
+            if name == "shell" && args["command"].as_str().is_some_and(|c| c.len() > 8000) {
+                return Err("命令太长".into());
+            }
+            let mode = self
+                .execution
+                .as_ref()
+                .map_or(Default::default(), |e| e.active_mode());
+            let external_target = tool.target_path(arguments)?;
+            let (decision, resolved) = if name == "load_skill" {
+                let path = external_target.as_ref().ok_or("Skill 目标路径无效")?;
+                crate::permission::assess(mode, root, "read_file", &json!({"path":path}))?
+            } else {
+                crate::permission::assess(mode, root, name, &args)?
+            };
+            target = resolved;
+            match decision {
+                crate::permission::Decision::Allow => {}
+                crate::permission::Decision::Deny(reason) => {
+                    return Err(format!("硬性拦截：{reason}"))
+                }
+                crate::permission::Decision::Ask(reason) => {
+                    let resources = if name == "shell" {
+                        crate::permission::shell_targets(
+                            root,
+                            args["command"].as_str().unwrap_or_default(),
+                        )
+                    } else {
+                        vec![]
+                    };
+                    let reason = if resources.is_empty() {
+                        reason
+                    } else {
+                        format!(
+                            "{reason}\n已解析的命令资源：{}",
+                            resources
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join("；")
+                        )
+                    };
+                    let execution = self
+                        .execution
+                        .as_ref()
+                        .ok_or_else(|| format!("需要本次审批：{reason}"))?;
+                    execution.approve(
+                        root.clone(),
+                        name,
+                        arguments,
+                        target.clone(),
+                        reason,
+                        abort,
+                    )?;
+                    if name == "shell"
+                        && resources
+                            != crate::permission::shell_targets(
+                                root,
+                                args["command"].as_str().unwrap_or_default(),
+                            )
+                    {
+                        return Err("命令目标路径已改变，需要重新审批".into());
+                    }
+                }
+            }
+            if abort.load(Ordering::Relaxed) {
+                return Err("已取消，操作未执行".into());
+            }
+            if name == "shell" && args.get("background").and_then(Value::as_bool) == Some(true) {
+                let execution = self.execution.as_ref().ok_or("后台进程需要会话执行底座")?;
+                return execution.spawn_process(
+                    root.clone(),
+                    required_string(arguments, "command")?,
+                    abort,
+                );
+            }
+        }
+        tool.call_authorized(arguments, abort, target.as_deref())
             .map(|s| self.finish_output(s, tool.output_limit()))
             .map_err(|s| self.finish_output(s, OUTPUT_CAP))
     }
@@ -265,14 +378,15 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "在工作区目录里执行一条命令，返回输出。用来查看或修改本机文件。一次只做一件事，不要把输出逐行当成结果。"
+        "在会话工作目录执行命令。默认前台执行，30 秒超时；长任务使用 background=true 登记后台进程并用 process_manage 查询。cwd 不构成系统沙箱；所有调用经过权限判断。"
     }
 
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string", "description": "要执行的命令" }
+                "command": { "type": "string", "description": "要执行的命令" },
+                "background": { "type": "boolean", "description": "true 登记为本会话后台进程，立即返回 task_id，用 process_manage 读取或停止" }
             },
             "required": ["command"],
             "additionalProperties": false
@@ -320,6 +434,18 @@ impl Tool for ReadTool {
         let path = required_string(arguments, "path")?;
         read_workspace_file(&self.root, &path)
     }
+    fn call_authorized(
+        &self,
+        arguments: &str,
+        abort: &AtomicBool,
+        target: Option<&Path>,
+    ) -> std::result::Result<String, String> {
+        if abort.load(Ordering::Relaxed) {
+            return Err("已取消".into());
+        }
+        let path = authorized_path(&self.root, &required_string(arguments, "path")?, target)?;
+        read_text_file(&path)
+    }
 }
 
 fn required_string(arguments: &str, key: &str) -> std::result::Result<String, String> {
@@ -342,9 +468,7 @@ fn run_command(
     if command.len() > 8_000 {
         return Err("命令太长".into());
     }
-    let mut child = Command::new("cmd.exe")
-        .arg("/C")
-        .arg(command)
+    let mut child = crate::execution::shell_command(command)
         .current_dir(root)
         .env("PYTHONIOENCODING", "utf-8")
         .stdin(Stdio::null())
@@ -352,6 +476,13 @@ fn run_command(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| format!("命令没有启动。{err}"))?;
+    let job = match crate::process_job::ProcessJob::attach(&child) {
+        Ok(job) => job,
+        Err(e) => {
+            crate::execution::kill_tree(&mut child);
+            return Err(format!("无法登记进程树，已停止：{e}"));
+        }
+    };
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let out_handle = thread::spawn(move || read_capped(stdout, 8 * 1024 * 1024));
@@ -363,6 +494,7 @@ fn run_command(
             Ok(None)
                 if abort.load(Ordering::Relaxed) || started.elapsed() > Duration::from_secs(30) =>
             {
+                job.terminate();
                 #[cfg(windows)]
                 {
                     let _ = Command::new("taskkill")
@@ -385,6 +517,7 @@ fn run_command(
             Err(err) => return Err(format!("命令中断了。{err}")),
         }
     };
+    job.terminate();
     let stdout = out_handle.join().unwrap_or_default();
     let stderr = err_handle.join().unwrap_or_default();
     let mut text = String::new();
@@ -444,6 +577,9 @@ fn read_capped(reader: Option<impl Read>, cap: usize) -> String {
 
 fn read_workspace_file(root: &Path, user_path: &str) -> std::result::Result<String, String> {
     let full = resolve_inside(root, user_path)?;
+    read_text_file(&full)
+}
+fn read_text_file(full: &Path) -> std::result::Result<String, String> {
     let meta = fs::metadata(&full).map_err(|err| format!("读不到。{err}"))?;
     if meta.is_dir() {
         return Err("这是目录，不是文件".into());
@@ -457,6 +593,22 @@ fn read_workspace_file(root: &Path, user_path: &str) -> std::result::Result<Stri
     }
     let text = String::from_utf8_lossy(&bytes);
     Ok(text.into_owned())
+}
+
+fn authorized_path(
+    root: &Path,
+    input: &str,
+    approved: Option<&Path>,
+) -> std::result::Result<PathBuf, String> {
+    if let Some(approved) = approved {
+        let current = crate::permission::resolve_path(root, input)?;
+        if current != approved {
+            return Err("目标路径已改变，需要重新审批".into());
+        }
+        Ok(current)
+    } else {
+        resolve_inside(root, input)
+    }
 }
 
 fn resolve_inside(root: &Path, user_path: &str) -> std::result::Result<PathBuf, String> {

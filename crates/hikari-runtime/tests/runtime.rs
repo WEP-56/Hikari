@@ -42,6 +42,7 @@ fn configuration_and_session_replace_previous_files_without_losing_transcript() 
             input: 10,
             output: 5,
         },
+        execution: Default::default(),
     };
     store.save(&[session.clone()]).unwrap();
     store.save(&[session]).unwrap();
@@ -53,6 +54,62 @@ fn configuration_and_session_replace_previous_files_without_losing_transcript() 
     assert!(loaded[0].pinned);
     fs::write(config_store.path(), b"invalid json").unwrap();
     assert!(config_store.load().is_err());
+}
+
+#[test]
+fn restart_preserves_todos_and_completes_unknown_tool_results_without_replay() {
+    use hikari_agent::{
+        execution::{Execution, ExecutionSnapshot, TaskStatus, TodoItem, TodoStatus},
+        ToolCall,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let execution = Execution::new(
+        "talk-7".into(),
+        ExecutionSnapshot {
+            todos: vec![TodoItem {
+                id: "one".into(),
+                text: "持久待办".into(),
+                status: TodoStatus::InProgress,
+            }],
+            ..Default::default()
+        },
+    );
+    execution
+        .begin(temp.path().to_owned(), "fixture".into())
+        .unwrap();
+    let mut assistant = Message::assistant("");
+    if let Message::Assistant { tool_calls, .. } = &mut assistant {
+        tool_calls.push(ToolCall {
+            id: "unknown".into(),
+            name: "shell".into(),
+            arguments: r#"{"command":"echo effect"}"#.into(),
+        });
+    }
+    let session = Session {
+        id: 7,
+        title: "crash".into(),
+        workspace: Some(temp.path().to_owned()),
+        pinned: false,
+        transcript: vec![assistant.clone()],
+        context: vec![assistant],
+        retained_until: 0,
+        context_base: 0,
+        memory_enabled: false,
+        usage: Usage::default(),
+        execution: execution.snapshot(),
+    };
+    let store = SessionStore::new(temp.path());
+    store.save(&[session]).unwrap();
+    let loaded = store.load().unwrap();
+    assert_eq!(loaded[0].execution.todos[0].text, "持久待办");
+    assert_eq!(loaded[0].execution.tasks[0].status, TaskStatus::Failed);
+    assert!(
+        matches!(loaded[0].context.last(),Some(Message::ToolResult {tool_call_id,is_error:true,text,..}) if tool_call_id=="unknown" && text.contains("未自动重跑"))
+    );
+    store.save(&loaded).unwrap();
+    let loaded = store.load().unwrap();
+    assert_eq!(loaded[0].context.len(), 2);
+    assert_eq!(loaded[0].execution.results.len(), 1);
 }
 
 #[test]

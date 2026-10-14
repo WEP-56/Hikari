@@ -257,6 +257,7 @@ fn session(id: u64, memory_enabled: bool, transcript: Vec<Message>) -> Session {
         context_base: 0,
         memory_enabled,
         usage: Usage::default(),
+        execution: Default::default(),
     }
 }
 

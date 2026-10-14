@@ -5,10 +5,13 @@
 
 pub mod agent;
 pub mod error;
+pub mod execution;
 pub mod memory;
 pub mod model;
 pub mod openai;
+pub mod permission;
 pub mod pi;
+mod process_job;
 pub mod protocols;
 pub mod provider;
 pub mod tool;

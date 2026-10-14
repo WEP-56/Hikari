@@ -20,6 +20,8 @@ pub struct Session {
     #[serde(default = "default_memory")]
     pub memory_enabled: bool,
     pub usage: Usage,
+    #[serde(default)]
+    pub execution: hikari_agent::execution::ExecutionSnapshot,
 }
 fn default_memory() -> bool {
     true
@@ -92,6 +94,19 @@ impl SessionStore {
                 let legacy = record.get("memory_enabled").is_none();
                 let mut session: Session = serde_json::from_value(record)
                     .map_err(|e| hikari_agent::AgentError::new(e.to_string()))?;
+                session.execution.recover();
+                // Complete interrupted tool pairs without executing them again. An effect may
+                // have succeeded between the last checkpoint and the process crash.
+                let interrupted: Vec<_> = session.context.iter().flat_map(|m|match m {
+                    Message::Assistant { tool_calls, .. } => tool_calls.as_slice(),
+                    _ => &[],
+                }).filter(|call|!session.context.iter().any(|m|matches!(m,Message::ToolResult { tool_call_id, .. } if tool_call_id==&call.id))).cloned().collect();
+                for call in interrupted {
+                    let mut result = Message::tool_result(&call.id,&call.name,"应用重启，调用结果未确认。可能已经产生副作用；未自动重跑，请先检查实际状态。",true);
+                    result.stamp(format!("talk-{}:interrupted:{}",session.id,call.id),true);
+                    session.context.push(result.clone());
+                    if !session.transcript.iter().any(|m|matches!(m,Message::ToolResult { tool_call_id, .. } if tool_call_id==&call.id)) { session.transcript.push(result); }
+                }
                 if legacy {
                     // Enable future turns without silently ingesting old conversation history.
                     session.retained_until = session.context.len();

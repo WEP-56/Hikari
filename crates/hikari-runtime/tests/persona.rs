@@ -48,6 +48,7 @@ fn crash_checkpoint_is_recovered_once_and_disabled_history_is_skipped() {
         context_base: 20,
         memory_enabled: true,
         usage: Usage::default(),
+        execution: Default::default(),
     }];
     assert!(recover_memory(&core, &models, &config, &mut sessions).is_empty());
     assert_eq!(sessions[0].retained_until, 1);

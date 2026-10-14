@@ -12,10 +12,10 @@ impl Preview {
         Switch::new("session-memory")
             .label("使用长期记忆")
             .checked(checked)
-            .disabled(self.busy && self.active.map(|i| self.talks[i].id) == self.running_talk)
+            .disabled(self.active_busy())
             .on_change(cx.listener(|this, value, _, cx| {
                 if let Some(i) = this.active {
-                    if this.busy && this.running_talk == Some(this.talks[i].id) {
+                    if this.talks[i].turn.is_some() {
                         return;
                     }
                     this.talks[i].memory_enabled = *value;
