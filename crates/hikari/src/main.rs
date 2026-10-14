@@ -1,3 +1,7 @@
+// Windows 下按 GUI 子系统构建，避免启动时由系统额外分配一个控制台窗口。
+// 从终端（cargo run / cmd / PowerShell）启动时标准输出仍由该终端接收。
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
