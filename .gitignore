@@ -21,3 +21,6 @@ Desktop.ini
 # GitHub Pages 本地依赖与构建产物
 pages/node_modules/
 pages/dist/
+
+# 助手工作目录（工作日志与记忆）
+.workbuddy/
