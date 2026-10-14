@@ -1,0 +1,105 @@
+name: Release
+
+# tag 驱动：推送 v* tag 时构建 Windows 安装包并创建/更新 Release。
+# 手动触发（workflow_dispatch）只构建并上传构建产物，不创建 Release，用于验证流程。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Windows setup
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest_version=$(sed -n 's/^version *= *"\([^"]*\)"/\1/p' crates/hikari/Cargo.toml | head -n 1)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            publish=true
+          else
+            version="$manifest_version"
+            publish=false
+          fi
+          if [[ -z "$version" ]]; then
+            echo "::error::无法从 tag 或 crates/hikari/Cargo.toml 确定版本号"
+            exit 1
+          fi
+          if [[ "$version" != "$manifest_version" ]]; then
+            echo "::error::tag v$version 与 crates/hikari/Cargo.toml 的 $manifest_version 不一致，请先对齐版本号"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "Hikari $version, publish=$publish"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-release
+
+      - name: Build hikari.exe
+        run: cargo build --release --locked --package hikari
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {
+            throw "安装 Inno Setup 失败，退出码 $LASTEXITCODE"
+          }
+
+      - name: Build setup
+        shell: pwsh
+        run: |
+          $iscc = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { throw "未找到 Inno Setup 编译器 ISCC.exe" }
+          & $iscc "/DAppVersion=${{ steps.version.outputs.version }}" "installer\hikari.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC 编译失败，退出码 $LASTEXITCODE" }
+          Get-ChildItem target\setup\*.exe | Select-Object Name, Length
+
+      - name: Upload setup artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hikari-${{ steps.version.outputs.version }}-windows-x64-setup
+          path: target/setup/*.exe
+          if-no-files-found: error
+
+      - name: Publish release
+        if: steps.version.outputs.publish == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Hikari ${{ steps.version.outputs.version }}
+          files: target/setup/*.exe
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
