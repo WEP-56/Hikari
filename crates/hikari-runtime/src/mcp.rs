@@ -160,7 +160,7 @@ impl McpManager {
         let result = (|| {
             let mut client = Client::connect(config, workspace)?;
             let abort = AtomicBool::new(false);
-            let init=client.rpc("initialize",json!({"protocolVersion":VERSION,"capabilities":{},"clientInfo":{"name":"hikari","version":"0.1.0"}}),&abort)?;
+            let init=client.rpc("initialize",json!({"protocolVersion":VERSION,"capabilities":{},"clientInfo":{"name":"hikari","version":"0.2.0"}}),&abort)?;
             let version = init["protocolVersion"]
                 .as_str()
                 .ok_or_else(|| AgentError::new("MCP initialize 缺少协议版本"))?;
