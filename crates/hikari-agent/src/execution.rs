@@ -51,7 +51,10 @@ impl Default for ExecutionBudget {
     fn default() -> Self {
         Self {
             elapsed_seconds: 1800,
-            tokens: 1_000_000,
+            // A long task resends its whole context on every model call. One million
+            // cumulative tokens is only a few large rounds, so real work was cut off
+            // by the forecast before the task was actually expensive.
+            tokens: 50_000_000,
             concurrent_tasks: 4,
             child_tasks: 16,
             output_bytes: 8 * 1024 * 1024,
@@ -168,6 +171,10 @@ pub struct Execution {
 impl Execution {
     pub fn new(session: String, mut snapshot: ExecutionSnapshot) -> Arc<Self> {
         snapshot.recover();
+        // Sessions saved before this default still carry the old million-token cap.
+        if snapshot.budget.tokens == 1_000_000 {
+            snapshot.budget.tokens = ExecutionBudget::default().tokens;
+        }
         Arc::new(Self {
             session,
             state: Arc::new(Mutex::new(State {
@@ -361,7 +368,7 @@ impl Execution {
                 )
             });
         if cumulative_tokens.saturating_add(others) >= s.snapshot.budget.tokens {
-            return Err("下一次模型请求将超过共享 token 预算".into());
+            return Err("共享 token 预算已用完".into());
         }
         s.reservations.insert(id, cumulative_tokens);
         Ok(())
@@ -603,22 +610,18 @@ impl Execution {
         }
         results
     }
-    pub fn wait(
-        &self,
-        mut request: Interaction,
-        timeout: Duration,
-        abort: &AtomicBool,
-    ) -> Result<Answer, String> {
+    pub fn wait(&self, mut request: Interaction, abort: &AtomicBool) -> Result<Answer, String> {
         let task_id = self.active().ok_or("没有活动任务")?;
-        let queued = Instant::now();
+        let paused = Instant::now();
         loop {
             if abort.load(Ordering::Relaxed) {
+                self.exclude_wait(paused.elapsed());
                 return Err("已取消，操作未执行".into());
             }
-            if queued.elapsed() >= timeout {
-                return Err("等待用户超时，操作未执行".into());
+            if let Err(e) = self.cancelled_while_waiting() {
+                self.exclude_wait(paused.elapsed());
+                return Err(e);
             }
-            self.check_deadline()?;
             let mut s = self.state.lock().unwrap();
             if s.pending.is_some() {
                 drop(s);
@@ -643,15 +646,11 @@ impl Execution {
             s.revision += 1;
             break;
         }
-        let started = Instant::now();
         let result = loop {
             if abort.load(Ordering::Relaxed) {
                 break Err("已取消，操作未执行".into());
             }
-            if started.elapsed() >= timeout {
-                break Err("等待用户超时，操作未执行".into());
-            }
-            if let Err(e) = self.check_budget(self.current_usage()) {
+            if let Err(e) = self.cancelled_while_waiting() {
                 break Err(e);
             }
             if let Some(answer) = self
@@ -666,6 +665,8 @@ impl Execution {
             }
             std::thread::sleep(Duration::from_millis(40));
         };
+        // Time spent on the panel is not work. Keep the task budget for execution.
+        self.exclude_wait(paused.elapsed());
         let mut s = self.state.lock().unwrap();
         if let Some(pending) = s.pending.take() {
             if let Some(t) = s
@@ -680,14 +681,35 @@ impl Execution {
         s.revision += 1;
         result
     }
-    fn current_usage(&self) -> Usage {
-        let id = self.active();
+    fn cancelled_while_waiting(&self) -> Result<(), String> {
+        let id = self.active().ok_or("没有活动任务")?;
         let s = self.state.lock().unwrap();
-        s.snapshot
-            .tasks
-            .iter()
-            .find(|t| Some(&t.task_id) == id.as_ref())
-            .map_or(Usage::default(), |t| t.usage)
+        let root = Self::root_id(&s.snapshot, &id);
+        if s.cancelled_roots.contains(&root) {
+            return Err("所属任务已取消".into());
+        }
+        if self
+            .cancellations
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return Err("子任务已取消".into());
+        }
+        Ok(())
+    }
+    fn exclude_wait(&self, waited: Duration) {
+        let Some(id) = self.active() else {
+            return;
+        };
+        let root = {
+            let s = self.state.lock().unwrap();
+            Self::root_id(&s.snapshot, &id)
+        };
+        if let Some(start) = self.clock.lock().unwrap().get_mut(&root) {
+            *start = start.checked_add(waited).unwrap_or(*start);
+        }
     }
     pub fn approve(
         &self,
@@ -710,7 +732,6 @@ impl Execution {
                 workspace: root,
                 target,
             },
-            Duration::from_secs(300),
             abort,
         )? {
             Answer::Allow => Ok(()),
@@ -1116,7 +1137,7 @@ impl Tool for SessionTool {
     fn description(&self) -> &str {
         match self.kind {
         "todo_list" => "维护本会话待办，action=list 或 replace；replace 传完整 items，每项含 id/text/status（pending/in_progress/completed）。独立保存，不依赖压缩摘要。",
-        "clarify" => "向用户提问并等待回答。question 必填，options 可选，timeout_seconds 1–600，默认 300。仅阻塞本会话，返回 answered/rejected/cancelled/timeout/failed。",
+        "clarify" => "向用户提问并一直等待回答。question 必填，options 可选。没有超时；用户回答、拒绝、取消，或任务被停止时才返回。仅阻塞本会话，返回 answered/rejected/cancelled/failed。",
         _ => "管理本会话通过 shell background=true 登记的进程。action=list/status/read/stop；read 的 offset/limit 为字符分页，返回 next_offset。不能操作任意 PID。",
     }
     }
@@ -1126,7 +1147,7 @@ impl Tool for SessionTool {
                 json!({"type":"object","properties":{"action":{"type":"string","enum":["list","replace"]},"items":{"type":"array","maxItems":100,"items":{"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed"]}},"required":["id","text","status"],"additionalProperties":false}}},"required":["action"],"additionalProperties":false})
             }
             "clarify" => {
-                json!({"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","maxItems":8,"items":{"type":"string"}},"timeout_seconds":{"type":"integer","minimum":1,"maximum":600}},"required":["question"],"additionalProperties":false})
+                json!({"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","maxItems":8,"items":{"type":"string"}}},"required":["question"],"additionalProperties":false})
             }
             _ => {
                 json!({"type":"object","properties":{"action":{"type":"string","enum":["list","status","read","stop"]},"task_id":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":12000}},"required":["action"],"additionalProperties":false})
@@ -1186,15 +1207,6 @@ impl Tool for SessionTool {
                 {
                     return Err("options 无效".into());
                 }
-                let timeout = args
-                    .get("timeout_seconds")
-                    .map(|v| {
-                        v.as_u64()
-                            .filter(|n| (1..=600).contains(n))
-                            .ok_or("timeout_seconds 无效")
-                    })
-                    .transpose()?
-                    .unwrap_or(300);
                 let root = self
                     .execution
                     .snapshot()
@@ -1216,14 +1228,13 @@ impl Tool for SessionTool {
                         workspace: root,
                         target: None,
                     },
-                    Duration::from_secs(timeout),
                     abort,
                 );
                 Ok(match result {
                     Ok(Answer::Text(text)) => json!({"status":"answered","answer":text}),
                     Ok(Answer::Reject) => json!({"status":"rejected"}),
                     Ok(_) => json!({"status":"cancelled"}),
-                    Err(e) => json!({"status":if abort.load(Ordering::Relaxed){"cancelled"} else if e.contains("超时"){"timeout"}else{"failed"},"reason":e}),
+                    Err(e) => json!({"status":if abort.load(Ordering::Relaxed){"cancelled"} else {"failed"},"reason":e}),
                 }.to_string())
             }
             _ => {

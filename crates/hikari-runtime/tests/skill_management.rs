@@ -187,14 +187,28 @@ fn direct_frozen_resource_reads_retain_sensitive_permission_checks() {
         .find_map(|line| line.strip_prefix("Base directory: "))
         .unwrap();
     let resource = std::path::Path::new(base).join("references/private.md");
-    for mode in [PermissionMode::Careful, PermissionMode::Autonomous] {
-        assert!(matches!(
-            assess(mode, temp.path(), "read_file", &json!({"path":resource}))
-                .unwrap()
-                .0,
-            Decision::Ask(_)
-        ));
-    }
+    assert!(matches!(
+        assess(
+            PermissionMode::Careful,
+            temp.path(),
+            "read_file",
+            &json!({"path":resource})
+        )
+        .unwrap()
+        .0,
+        Decision::Ask(_)
+    ));
+    assert_eq!(
+        assess(
+            PermissionMode::Autonomous,
+            temp.path(),
+            "read_file",
+            &json!({"path":resource})
+        )
+        .unwrap()
+        .0,
+        Decision::Allow
+    );
     let guarded = ToolRegistry::workspace(temp.path());
     assert!(guarded
         .call("read_file", &json!({"path":resource}).to_string())

@@ -427,7 +427,17 @@ impl ToolRegistry {
                 )?;
                 (
                     if name == "skill_manage" && args["action"] != "history" {
-                        crate::permission::Decision::Ask("Skill 管理将修改可执行指令及资源".into())
+                        if mode == crate::permission::PermissionMode::Autonomous {
+                            if args["action"] == "delete" {
+                                crate::permission::Decision::Ask("删除 Skill 需要确认".into())
+                            } else {
+                                crate::permission::Decision::Allow
+                            }
+                        } else {
+                            crate::permission::Decision::Ask(
+                                "Skill 管理将修改可执行指令及资源".into(),
+                            )
+                        }
                     } else {
                         decision
                     },

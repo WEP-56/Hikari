@@ -361,12 +361,10 @@ pub fn run_turn_with_control(
 
         let input = host.provider.input_tokens(&context);
         if let Some(execution) = host.tools.execution() {
-            let required = budget_usage
-                .total()
-                .saturating_add(input as u64)
-                .saturating_add(host.provider.output_reserve() as u64);
-            if required >= execution.available_tokens() {
-                error = Some("下一次模型请求将超过任务 token 预算".into());
+            // Stop on tokens already spent. Do not refuse the next call just because
+            // resending the context plus the maximum output reserve might cross the cap.
+            if budget_usage.total() >= execution.available_tokens() {
+                error = Some("任务 token 预算已用完".into());
                 break;
             }
         }
@@ -393,12 +391,7 @@ pub fn run_turn_with_control(
         }
 
         if let Some(execution) = host.tools.execution() {
-            if let Err(reason) = execution.reserve_request(
-                budget_usage
-                    .total()
-                    .saturating_add(input as u64)
-                    .saturating_add(host.provider.output_reserve() as u64),
-            ) {
+            if let Err(reason) = execution.reserve_request(budget_usage.total()) {
                 error = Some(reason);
                 break;
             }
@@ -878,13 +871,8 @@ fn maybe_compact(
     let mut summary = String::new();
     let estimated_input = host.provider.input_tokens(&context) as u64;
     if let Some(execution) = host.tools.execution() {
-        if budget_usage
-            .total()
-            .saturating_add(estimated_input)
-            .saturating_add(host.provider.output_reserve() as u64)
-            >= execution.available_tokens()
-        {
-            let error = "摘要请求将超过任务 token 预算".to_string();
+        if budget_usage.total() >= execution.available_tokens() {
+            let error = "任务 token 预算已用完".to_string();
             on_event(AgentEvent::AutoCompactionEnd {
                 error: Some(error.clone()),
             });
@@ -893,12 +881,7 @@ fn maybe_compact(
     }
     let mut summary_usage = Usage::default();
     if let Some(execution) = host.tools.execution() {
-        if let Err(error) = execution.reserve_request(
-            budget_usage
-                .total()
-                .saturating_add(estimated_input)
-                .saturating_add(host.provider.output_reserve() as u64),
-        ) {
+        if let Err(error) = execution.reserve_request(budget_usage.total()) {
             on_event(AgentEvent::AutoCompactionEnd {
                 error: Some(error.clone()),
             });

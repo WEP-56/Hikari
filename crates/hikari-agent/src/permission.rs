@@ -20,7 +20,7 @@ impl PermissionMode {
     pub fn description(self) -> &'static str {
         match self {
             Self::Careful => "ta 会在关键行动前与你确认。",
-            Self::Autonomous => "ta 会自主处理常规操作，仅在重要事项前确认。",
+            Self::Autonomous => "ta 会自主完成常规操作，只有删除会先问你。",
         }
     }
 }
@@ -93,11 +93,11 @@ pub fn assess(
         "read_file" | "read" | "write" | "edit" | "ls" | "find" | "grep"
     ) {
         let path = resolve_path(root, args["path"].as_str().ok_or("缺少 path")?)?;
-        let decision = if sensitive(&path) {
+        let decision = if mode == PermissionMode::Autonomous {
+            Decision::Allow
+        } else if sensitive(&path) {
             Decision::Ask("访问或修改敏感资源".into())
-        } else if mode == PermissionMode::Careful
-            && !path.starts_with(root.canonicalize().map_err(|e| e.to_string())?)
-        {
+        } else if !path.starts_with(root.canonicalize().map_err(|e| e.to_string())?) {
             Decision::Ask("访问工作区外路径".into())
         } else {
             Decision::Allow
@@ -120,8 +120,15 @@ pub fn assess(
         | "search_observations"
         | "expand"
         | "forget" => Decision::Allow,
-        // Includes every MCP and future extension tool. Hints never grant authority.
-        _ => Decision::Ask("外部工具或扩展操作需要确认".into()),
+        // Careful mode confirms MCP and other extensions. Hints never grant authority.
+        // Autonomous mode only stops for deletion, which these tools do not express.
+        _ => {
+            if mode == PermissionMode::Autonomous {
+                Decision::Allow
+            } else {
+                Decision::Ask("外部工具或扩展操作需要确认".into())
+            }
+        }
     };
     Ok((decision, None))
 }
@@ -331,9 +338,48 @@ fn catastrophic(command: &str) -> bool {
 pub fn assess_command(mode: PermissionMode, root: &Path, command: &str) -> Decision {
     inspect_command(mode, root, command, 0)
 }
+fn deletion_like(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    if ["drop table", "drop database", "truncate table", "delete from"]
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+        || lower.contains("unlink")
+    {
+        return true;
+    }
+    let tokens = words(&lower);
+    if tokens.windows(2).any(|pair| pair[0] == "git" && pair[1] == "clean") {
+        return true;
+    }
+    tokens.iter().any(|token| {
+        let executable = token
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(token)
+            .trim_end_matches(".exe");
+        matches!(
+            executable,
+            "rm" | "rd" | "rmdir" | "del" | "erase" | "remove-item" | "shred"
+        ) || token == "-delete"
+            || token == "--delete"
+    })
+}
+
+fn unless_deletion(command: &str) -> Decision {
+    if deletion_like(command) {
+        Decision::Ask("删除需要确认".into())
+    } else {
+        Decision::Allow
+    }
+}
+
 fn inspect_command(mode: PermissionMode, root: &Path, command: &str, depth: usize) -> Decision {
     if depth > 8 {
-        return Decision::Ask("包装命令层数过多".into());
+        return if mode == PermissionMode::Autonomous {
+            unless_deletion(command)
+        } else {
+            Decision::Ask("包装命令层数过多".into())
+        };
     }
     if catastrophic(command) {
         return Decision::Deny("禁止灾难性磁盘或系统清除操作".into());
@@ -385,7 +431,11 @@ fn inspect_command(mode: PermissionMode, root: &Path, command: &str, depth: usiz
                     );
                 }
             }
-            return Decision::Ask("无法解析编码命令".into());
+            return if mode == PermissionMode::Autonomous {
+                unless_deletion(command)
+            } else {
+                Decision::Ask("无法解析编码命令".into())
+            };
         }
     }
     if matches!(
@@ -400,7 +450,14 @@ fn inspect_command(mode: PermissionMode, root: &Path, command: &str, depth: usiz
         }) {
             return inspect_command(mode, root, &tokens[i + 1..].join(" "), depth + 1);
         }
-        return Decision::Ask("无法确定包装命令的实际动作".into());
+        return if mode == PermissionMode::Autonomous {
+            unless_deletion(command)
+        } else {
+            Decision::Ask("无法确定包装命令的实际动作".into())
+        };
+    }
+    if mode == PermissionMode::Autonomous {
+        return unless_deletion(command);
     }
     // Do not try to prove arbitrary scripts or compound shell syntax harmless.
     if tokens
