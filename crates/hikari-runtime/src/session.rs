@@ -1,6 +1,8 @@
 use crate::config::{read_json_or_default, write_json};
 use hikari_agent::{Message, Result, Usage};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::PathBuf;
 
 /// UI transcript survives context compaction; context is the active provider window.
@@ -31,25 +33,36 @@ pub struct SessionStore {
     path: PathBuf,
 }
 impl SessionStore {
-    /// Only flat, host-owned artifact files are removed; linked directories are rejected.
+    /// Only flat content-addressed host resources are removed. Unknown files and links
+    /// survive cleanup, and a nonempty session directory is deliberately retained.
     pub fn remove_artifacts(&self, id: u64) -> Result<()> {
+        self.remove_resource_directory(&format!("talk-{id}"))
+    }
+    /// Draft attachment references live only in memory and cannot survive app restart.
+    /// Call once at startup, before accepting fresh draft attachments.
+    pub fn remove_draft_artifacts(&self) -> Result<()> {
+        self.remove_resource_directory("draft")
+    }
+    fn remove_resource_directory(&self, directory: &str) -> Result<()> {
         let parent = self
             .path
             .parent()
             .ok_or_else(|| hikari_agent::AgentError::new("会话数据目录无效"))?;
         let root = parent.join("artifacts");
-        let target = root.join(format!("talk-{id}"));
+        let target = root.join(directory);
         if !target.exists() {
             return Ok(());
         }
         let data = parent
             .canonicalize()
             .map_err(|e| hikari_agent::AgentError::new(e.to_string()))?;
-        let expected = data.join("artifacts").join(format!("talk-{id}"));
-        if root
-            .canonicalize()
-            .map_err(|e| hikari_agent::AgentError::new(e.to_string()))?
-            != data.join("artifacts")
+        let expected = data.join("artifacts").join(directory);
+        if is_link(&std::fs::symlink_metadata(&root).map_err(resource_error)?)
+            || is_link(&std::fs::symlink_metadata(&target).map_err(resource_error)?)
+            || root
+                .canonicalize()
+                .map_err(|e| hikari_agent::AgentError::new(e.to_string()))?
+                != data.join("artifacts")
             || target
                 .canonicalize()
                 .map_err(|e| hikari_agent::AgentError::new(e.to_string()))?
@@ -64,19 +77,46 @@ impl SessionStore {
         {
             let entry = entry.map_err(|e| hikari_agent::AgentError::new(e.to_string()))?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name
-                .strip_suffix(".txt")
-                .is_some_and(|id| id.len() == 64 && id.bytes().all(|c| c.is_ascii_hexdigit()))
-                && entry
-                    .file_type()
-                    .map_err(|e| hikari_agent::AgentError::new(e.to_string()))?
-                    .is_file()
+            let metadata = std::fs::symlink_metadata(entry.path()).map_err(resource_error)?;
+            if !metadata.is_file() || is_link(&metadata) {
+                continue;
+            }
+            let Some((hash, ext)) = name.rsplit_once('.') else {
+                continue;
+            };
+            if hash.len() != 64
+                || !hash.bytes().all(|c| c.is_ascii_hexdigit())
+                || !matches!(ext, "txt" | "png" | "jpg" | "webp" | "gif" | "bin")
             {
+                continue;
+            }
+            let resolved = entry.path().canonicalize().map_err(resource_error)?;
+            if resolved.parent() != Some(expected.as_path()) {
+                continue;
+            }
+            let mut file = std::fs::File::open(entry.path()).map_err(resource_error)?;
+            let mut digest = Sha256::new();
+            let mut buffer = [0u8; 8192];
+            loop {
+                let count = file.read(&mut buffer).map_err(resource_error)?;
+                if count == 0 {
+                    break;
+                }
+                digest.update(&buffer[..count]);
+            }
+            if format!("{:x}", digest.finalize()).eq_ignore_ascii_case(hash) {
                 std::fs::remove_file(entry.path())
                     .map_err(|e| hikari_agent::AgentError::new(e.to_string()))?;
             }
         }
-        std::fs::remove_dir(target).map_err(|e| hikari_agent::AgentError::new(e.to_string()))
+        if std::fs::read_dir(&target)
+            .map_err(resource_error)?
+            .next()
+            .is_none()
+        {
+            std::fs::remove_dir(target).map_err(resource_error)?;
+        }
+        Ok(())
     }
     pub fn path(&self) -> &std::path::Path {
         &self.path
@@ -125,6 +165,21 @@ impl SessionStore {
             sync_transcript_origins(&mut session.transcript, &session.context);
         }
         write_json(&self.path, &sessions)
+    }
+}
+
+fn resource_error(error: std::io::Error) -> hikari_agent::AgentError {
+    hikari_agent::AgentError::new(error.to_string())
+}
+fn is_link(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
     }
 }
 

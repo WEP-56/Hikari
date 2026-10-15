@@ -294,13 +294,7 @@ impl ProtocolProvider {
 
 impl Provider for ProtocolProvider {
     fn input_tokens(&self, context: &Context<'_>) -> u32 {
-        u32::try_from(
-            request_body(&self.config, context)
-                .to_string()
-                .len()
-                .div_ceil(3),
-        )
-        .unwrap_or(u32::MAX)
+        crate::provider::estimate_request(context, |context| request_body(&self.config, context))
     }
     fn output_reserve(&self) -> u32 {
         self.config.max_output_tokens
@@ -422,6 +416,41 @@ pub fn endpoint(config: &ProviderConfig) -> String {
     }
 }
 
+/// Project rich tool metadata into text fields understood by all three APIs.
+/// The transcript's text is authoritative after artifact truncation.
+pub(crate) fn tool_result_text(message: &Message) -> String {
+    let Message::ToolResult {
+        text,
+        is_error,
+        output,
+        ..
+    } = message
+    else {
+        return message.text().to_owned();
+    };
+    if let Some(output) = output {
+        if output.structured.is_some()
+            || output.failure.is_some()
+            || output.truncated
+            || output.retryable
+            || *is_error
+        {
+            return json!({
+                "text":text,
+                "structured":output.structured,
+                "failure":output.failure,
+                "is_error":*is_error || output.failure.is_some(),
+                "truncated":output.truncated,
+                "retryable":output.retryable
+            })
+            .to_string();
+        }
+    } else if *is_error {
+        return json!({"text":text,"is_error":true}).to_string();
+    }
+    text.to_owned()
+}
+
 pub fn request_body(config: &ProviderConfig, context: &Context<'_>) -> Value {
     let changes = catalog_changes(context);
     let latest_matches = context
@@ -492,7 +521,7 @@ pub fn request_body(config: &ProviderConfig, context: &Context<'_>) -> Value {
                             }
                         }
                     },
-                    Message::User { text, .. } => input.push(json!({"role":"user","content":text})),
+                    Message::User { text, attachments, .. } => input.push(json!({"role":"user","content":if attachments.is_empty(){json!(text)}else{crate::attachment::content_parts(text, attachments, "responses")}})),
                     Message::Assistant { text, tool_calls, provider_metadata, .. } => {
                         if let Some(meta) = provider_metadata.as_ref().filter(|m| m.protocol == "responses") {
                             input.extend(meta.items.clone());
@@ -504,8 +533,8 @@ pub fn request_body(config: &ProviderConfig, context: &Context<'_>) -> Value {
                             }
                         }
                     }
-                    Message::ToolResult { tool_call_id, text, .. } => input.push(json!({
-                        "type":"function_call_output","call_id":tool_call_id.split('|').next().unwrap_or(tool_call_id),"output":text
+                    Message::ToolResult { tool_call_id, attachments, .. } => input.push(json!({
+                        "type":"function_call_output","call_id":tool_call_id.split('|').next().unwrap_or(tool_call_id),"output":if attachments.is_empty(){json!(tool_result_text(message))}else{crate::attachment::content_parts(&tool_result_text(message), attachments,"responses")}
                     })),
                     Message::ContextSummary { text } => input.push(json!({"role":"developer","content":text})),
                 }
@@ -558,9 +587,13 @@ pub fn request_body(config: &ProviderConfig, context: &Context<'_>) -> Value {
                         }
                         continue;
                     }
-                    Message::User { text, .. } | Message::ContextSummary { text } => {
-                        ("user", vec![json!({"type":"text","text":text})])
-                    }
+                    Message::User { text, .. } | Message::ContextSummary { text } => (
+                        "user",
+                        crate::attachment::content_parts(text, message.attachments(), "anthropic")
+                            .as_array()
+                            .unwrap()
+                            .clone(),
+                    ),
                     Message::Assistant {
                         text,
                         tool_calls,
@@ -589,13 +622,13 @@ pub fn request_body(config: &ProviderConfig, context: &Context<'_>) -> Value {
                     }
                     Message::ToolResult {
                         tool_call_id,
-                        text,
                         is_error,
+                        output,
                         ..
                     } => (
                         "user",
                         vec![json!({
-                            "type":"tool_result","tool_use_id":tool_call_id,"content":text,"is_error":is_error
+                            "type":"tool_result","tool_use_id":tool_call_id,"content":if message.attachments().is_empty(){json!(tool_result_text(message))}else{crate::attachment::content_parts(&tool_result_text(message),message.attachments(),"anthropic")},"is_error":*is_error || output.as_ref().is_some_and(|value|value.failure.is_some())
                         })],
                     ),
                 };

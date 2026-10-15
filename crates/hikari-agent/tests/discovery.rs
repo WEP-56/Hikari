@@ -249,6 +249,258 @@ fn long_output_is_saved_and_read_without_losing_unicode() {
         .is_err());
 }
 
+struct RichOutput(ToolOutput);
+impl Tool for RichOutput {
+    fn name(&self) -> &str {
+        "rich_output"
+    }
+    fn description(&self) -> &str {
+        "fixture structured output"
+    }
+    fn parameters(&self) -> Value {
+        json!({})
+    }
+    fn call(&self, _: &str) -> std::result::Result<String, String> {
+        Ok(self.0.text.clone())
+    }
+    fn call_output(
+        &self,
+        _: &str,
+        _: &AtomicBool,
+        _: Option<&std::path::Path>,
+    ) -> std::result::Result<ToolOutput, String> {
+        Ok(self.0.clone())
+    }
+}
+
+#[test]
+fn oversized_structured_result_is_saved_and_reconstructed_through_character_pages() {
+    let root = tempfile::tempdir().unwrap();
+    let attachment =
+        hikari_agent::attachment::AttachmentStore::new(root.path().join("attachments"))
+            .import("preview.png", "image/png", b"\x89PNG\r\n\x1a\nfixture")
+            .unwrap();
+    let structured = json!({"rows":(0..8000).map(|index|json!({"index":index,"note":"笔记🙂"})).collect::<Vec<_>>()});
+    let failure = ToolFailure {
+        kind: "partial_result".into(),
+        message: "one source unavailable".into(),
+    };
+    let mut registry = ToolRegistry::new(vec![Arc::new(RichOutput(ToolOutput {
+        text: "partial report".into(),
+        structured: Some(structured.clone()),
+        attachments: vec![attachment.clone()],
+        failure: Some(failure.clone()),
+        retryable: true,
+        truncated: false,
+    }))]);
+    registry
+        .enable_artifacts(root.path().join("artifacts"))
+        .unwrap();
+    let output = registry
+        .call_output("rich_output", "{}", &AtomicBool::new(false))
+        .unwrap();
+    assert!(output.truncated);
+    assert_eq!(output.text, "partial report");
+    assert_eq!(output.attachments, vec![attachment]);
+    assert_eq!(output.failure, Some(failure));
+    assert!(output.retryable);
+    let reference = &output.structured.as_ref().unwrap()["artifact_ref"];
+    assert_eq!(reference["tool"], "artifact_read");
+    assert_eq!(reference["format"], "json");
+    let id = reference["id"].as_str().unwrap();
+    let mut offset = 0;
+    let mut recovered = String::new();
+    loop {
+        let page: Value = serde_json::from_str(
+            &registry
+                .call(
+                    "artifact_read",
+                    &json!({"id":id,"offset":offset,"limit":12000}).to_string(),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        recovered.push_str(page["text"].as_str().unwrap());
+        offset = page["next_offset"].as_u64().unwrap();
+        if !page["has_more"].as_bool().unwrap() {
+            break;
+        }
+    }
+    assert_eq!(
+        serde_json::from_str::<Value>(&recovered).unwrap(),
+        structured
+    );
+    assert_eq!(offset, reference["total_chars"].as_u64().unwrap());
+    assert!(
+        output.structured.unwrap().to_string().chars().count() + output.text.chars().count()
+            < 16000
+    );
+}
+
+#[test]
+fn text_and_structured_result_share_one_allowance_and_no_store_is_explicit() {
+    // Each field fits individually, but their combined size exceeds the tool budget.
+    let registry = ToolRegistry::new(vec![Arc::new(RichOutput(ToolOutput {
+        text: "summary ".repeat(1200),
+        structured: Some(json!({"records":"值🙂".repeat(5000)})),
+        ..Default::default()
+    }))]);
+    let output = registry
+        .call_output("rich_output", "{}", &AtomicBool::new(false))
+        .unwrap();
+    assert!(output.truncated);
+    let replacement = output.structured.as_ref().unwrap();
+    assert!(replacement["note"]
+        .as_str()
+        .unwrap()
+        .contains("未启用 artifact"));
+    assert!(replacement["note"].as_str().unwrap().contains("不可恢复"));
+    assert!(replacement.get("artifact_ref").is_none());
+    assert_eq!(replacement["truncated"], true);
+    assert!(replacement.to_string().chars().count() + output.text.chars().count() <= 16000);
+    assert!(!output.retryable);
+    assert!(output.failure.is_none());
+    let small = ToolOutput {
+        text: "done".into(),
+        structured: Some(json!({"count":2})),
+        ..Default::default()
+    };
+    let registry = ToolRegistry::new(vec![Arc::new(RichOutput(small.clone()))]);
+    assert_eq!(
+        registry
+            .call_output("rich_output", "{}", &AtomicBool::new(false))
+            .unwrap(),
+        small
+    );
+}
+
+fn rich_result_chars(output: &ToolOutput) -> usize {
+    output.text.chars().count()
+        + output
+            .structured
+            .as_ref()
+            .map_or(0, |value| value.to_string().chars().count())
+        + output.failure.as_ref().map_or(0, |failure| {
+            serde_json::to_string(failure).unwrap().chars().count()
+        })
+}
+
+#[test]
+fn oversized_failure_kind_and_message_share_budget_and_are_recoverable() {
+    let root = tempfile::tempdir().unwrap();
+    let attachment =
+        hikari_agent::attachment::AttachmentStore::new(root.path().join("attachments"))
+            .import("error.txt", "text/plain", b"diagnostic")
+            .unwrap();
+    let failure = ToolFailure {
+        kind: "bad\"\\\n".repeat(2000),
+        message: "MCP 错误🙂\n".repeat(8000),
+    };
+    // MCP isError results commonly copy the same long text into failure.message.
+    let mut registry = ToolRegistry::new(vec![Arc::new(RichOutput(ToolOutput {
+        text: failure.message.clone(),
+        structured: Some(json!({"details":"细节".repeat(9000)})),
+        failure: Some(failure.clone()),
+        attachments: vec![attachment.clone()],
+        retryable: true,
+        ..Default::default()
+    }))]);
+    registry
+        .enable_artifacts(root.path().join("artifacts"))
+        .unwrap();
+    let output = registry
+        .call_output("rich_output", "{}", &AtomicBool::new(false))
+        .unwrap();
+    assert!(output.truncated);
+    assert!(rich_result_chars(&output) <= 16000);
+    assert_eq!(output.attachments, vec![attachment]);
+    assert!(output.retryable);
+    let bounded_failure = output.failure.as_ref().unwrap();
+    assert_eq!(bounded_failure.kind, "truncated_failure");
+    let id = bounded_failure
+        .message
+        .split("id=")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    let mut offset = 0;
+    let mut recovered = String::new();
+    loop {
+        let page: Value = serde_json::from_str(
+            &registry
+                .call(
+                    "artifact_read",
+                    &json!({"id":id,"offset":offset,"limit":12000}).to_string(),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        recovered.push_str(page["text"].as_str().unwrap());
+        offset = page["next_offset"].as_u64().unwrap();
+        if page["has_more"] == false {
+            break;
+        }
+    }
+    assert_eq!(
+        serde_json::from_str::<ToolFailure>(&recovered).unwrap(),
+        failure
+    );
+}
+
+#[test]
+fn failure_without_artifacts_is_explicit_and_short_failures_stay_intact() {
+    let registry = ToolRegistry::new(vec![Arc::new(RichOutput(ToolOutput {
+        text: "错误🙂".repeat(9000),
+        failure: Some(ToolFailure {
+            kind: "remote_error".into(),
+            message: "错误🙂".repeat(9000),
+        }),
+        ..Default::default()
+    }))]);
+    let output = registry
+        .call_output("rich_output", "{}", &AtomicBool::new(false))
+        .unwrap();
+    assert!(output.truncated);
+    assert!(rich_result_chars(&output) <= 16000);
+    let failure = output.failure.as_ref().unwrap();
+    assert_eq!(failure.kind, "remote_error");
+    assert!(failure.message.contains("未启用 artifact"));
+    assert!(failure.message.contains("不可恢复"));
+
+    let short_failure = ToolFailure {
+        kind: "remote_error".into(),
+        message: "source unavailable".into(),
+    };
+    let short = ToolOutput {
+        text: "failed".into(),
+        failure: Some(short_failure.clone()),
+        ..Default::default()
+    };
+    let registry = ToolRegistry::new(vec![Arc::new(RichOutput(short.clone()))]);
+    assert_eq!(
+        registry
+            .call_output("rich_output", "{}", &AtomicBool::new(false))
+            .unwrap(),
+        short
+    );
+
+    let root = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::new(vec![Arc::new(RichOutput(ToolOutput {
+        text: "a".repeat(16000),
+        failure: Some(short_failure.clone()),
+        ..Default::default()
+    }))]);
+    registry.enable_artifacts(root.path().into()).unwrap();
+    let output = registry
+        .call_output("rich_output", "{}", &AtomicBool::new(false))
+        .unwrap();
+    assert_eq!(output.failure, Some(short_failure));
+    assert!(output.text.contains("artifact_read"));
+    assert!(rich_result_chars(&output) <= 16000);
+}
+
 #[test]
 fn oversized_system_and_schema_stop_before_provider_request() {
     struct NoCall;

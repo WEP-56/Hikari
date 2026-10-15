@@ -4,6 +4,9 @@
 //! 召回只附在这一次请求的系统提示上，不写入 session。
 
 pub mod agent;
+pub mod attachment;
+pub mod delegate;
+pub use attachment::{Attachment, AttachmentStore, ToolFailure, ToolOutput};
 pub mod error;
 pub mod execution;
 pub mod memory;

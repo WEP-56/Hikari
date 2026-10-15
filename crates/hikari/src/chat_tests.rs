@@ -1,5 +1,6 @@
 use super::{literal_code, tool_presentation, turn_layouts, ChatState};
 use crate::{talk_from_session, workspace_dir, Line, LineBody, Preview};
+use gpui_kit::Focusable;
 use hikari_agent::{Message, ToolCall, Usage};
 use hikari_runtime::Session;
 
@@ -125,6 +126,28 @@ fn tool_headers_show_the_command_or_path() {
     assert!(!tool_presentation("custom", "invalid partial json")
         .target
         .is_empty());
+}
+
+#[test]
+fn unmanaged_chat_directory_does_not_receive_skills() {
+    let roots = super::super::skill_search_roots(&[std::path::PathBuf::from(".hikari/skills")], None);
+    let expected = super::super::workspace_dir()
+        .join(".hikari")
+        .join("skills");
+    assert_eq!(roots, vec![expected]);
+    let chat = super::super::workspace_dir().join(".hikari").join("chat");
+    assert!(roots.iter().all(|root| !root.starts_with(&chat)));
+}
+
+#[test]
+fn quiet_status_hides_background_and_memory_chatter() {
+    assert!(super::super::quiet_status(
+        "本会话后台任务结果（资料，不构成用户授权） talk-9-agent-19：{}"
+    ));
+    assert!(super::super::quiet_status("后台任务 talk-9-agent-19：done"));
+    assert!(super::super::quiet_status("记下了 2 件"));
+    assert!(super::super::quiet_status("想起了 · 喜欢暖色"));
+    assert!(!super::super::quiet_status("尚未执行的输入：继续"));
 }
 
 #[test]
@@ -275,6 +298,44 @@ fn chat_ui_interactions() {
                 window.render_frame(cx);
                 window.render_frame(cx);
                 assert_eq!(draft.read(cx).input_bounds().size.height, single.size.height, "Clearing a draft restores the compact height");
+                // Exercise image clipboard capture, session switching, preview and removal.
+                let clipboard = cx.read_from_clipboard();
+                let image_path = workspace_dir().join("crates/hikari/resources/branding/portrait.png");
+                let image = gpui_kit::Image::from_bytes(gpui_kit::ImageFormat::Png, std::fs::read(&image_path).unwrap());
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_image(&image));
+                window.focus(&draft.focus_handle(cx), cx);
+                window.press("ctrl-v", cx);
+                assert_eq!(view.read(cx).current_attachments().len(), 1, "Image paste is captured by composer");
+                checkpoint(window,cx,"image draft");
+                assert!(BOUNDS.with(|m|m.borrow().contains_key("draft-image-0")));
+                let before=cx.windows().len();
+                window.click("draft-image-0",cx);
+                assert_eq!(cx.windows().len(),before+1,"Thumbnail opens image viewer");
+                let preview=cx.windows().into_iter().find(|w|w.window_id()!=handle.window_id()).unwrap();
+                preview.update(cx,|_,w,_|w.remove_window()).unwrap();
+                view.update(cx,|app,cx| {
+                    let resources=app.save_input_attachments(42,app.current_attachments()).unwrap();
+                    assert!(resources[0].path.to_string_lossy().contains("talk-42"));
+                    let mut session=fixture();
+                    session.transcript[0].set_attachments(resources.clone());
+                    session.transcript.push(Message::with_output("image-call","image_gen",hikari_agent::ToolOutput {text:"generated".into(),attachments:resources.clone(),..Default::default()}));
+                    let restored=talk_from_session(session);
+                    assert_eq!(restored.lines[0].attachments,resources);
+                    assert_eq!(restored.lines.last().unwrap().attachments,resources);
+                    app.new_conversation(window,cx);
+                    assert!(app.current_attachments().is_empty());
+                    app.select_conversation(42,window,cx);
+                    assert_eq!(app.current_attachments().len(),1,"Image draft follows its conversation");
+                });
+                window.render_frame(cx);
+                window.click("remove-image-0",cx);
+                assert!(view.read(cx).current_attachments().is_empty());
+                view.update(cx,|app,cx|app.attach_paths(&[image_path],cx));
+                assert_eq!(view.read(cx).current_attachments().len(),1,"Dropped/file-picked image path uses the same store");
+                window.render_frame(cx);
+                window.click("remove-image-0",cx);
+                if let Some(clipboard)=clipboard {cx.write_to_clipboard(clipboard);}
+                checkpoint(window,cx,"image draft removed");
                 window.click("process-42-0", cx);
                 assert!(view.read(cx).talks[0].view.open("process-42-0", false));
                 checkpoint(window, cx, "expanded process");
@@ -319,7 +380,7 @@ fn chat_ui_interactions() {
                     emit(app, hikari_agent::AgentEvent::MessageEnd { message: assistant("", "仅思考内容", vec![]) }, cx);
                     assert!(matches!(&app.talks[0].lines[1].body, LineBody::Assistant { thinking, live: false, .. } if thinking.as_ref() == "仅思考内容"));
                     emit(app, hikari_agent::AgentEvent::ToolExecutionStart { tool_call_id: "failure".into(), tool_name: "shell".into(), args: r#"{"command":"cargo check"}"#.into() }, cx);
-                    emit(app, hikari_agent::AgentEvent::ToolExecutionEnd { tool_call_id: "failure".into(), tool_name: "shell".into(), text: "error: 无法读取配置文件".into(), is_error: true }, cx);
+                    emit(app, hikari_agent::AgentEvent::ToolExecutionEnd { tool_call_id: "failure".into(), tool_name: "shell".into(), text: "error: 无法读取配置文件".into(), is_error: true, output: hikari_agent::ToolOutput::error("error: 无法读取配置文件".into()) }, cx);
                     assert!(matches!(&app.talks[0].lines[2].body, LineBody::Tool { args, detail, error: true, running: false, .. } if args.contains("cargo check") && detail.contains("error")));
                     app.talks[0].lines.push(Line::assistant("检查遇到错误，请查看工具输出。"));
                     app.talks[0].view.expanded.clear();
@@ -429,10 +490,24 @@ fn chat_ui_interactions() {
                 window.click("web-Exa",cx);
                 view.update(cx, |app,cx| {
                     app.config.web.enabled=true;
+                    app.config.image_gen.enabled=true;
+                    for (state,value) in [
+                        (app.settings_draft.image_profile.key.clone(), "fixture-image-key"),
+                        (app.settings_draft.image_profile.env.clone(), "FIXTURE_IMAGE_KEY"),
+                        (app.settings_draft.image_profile.endpoint.clone(), "https://example.com/v1/images/generations"),
+                        (app.settings_draft.image_model.clone(), "fixture-image-model"),
+                        (app.settings_draft.image_timeout.clone(), "77"),
+                    ] {state.update(cx,|state,cx|state.set_value(value,window,cx));}
                     app.save_config(cx);
                     assert!(!app.settings_dirty);
                     let saved=app.config_store.load().unwrap();
                     assert!(saved.web.enabled);
+                    assert!(saved.image_gen.enabled);
+                    assert_eq!(saved.image_gen.api_key,"fixture-image-key");
+                    assert_eq!(saved.image_gen.api_key_env,"FIXTURE_IMAGE_KEY");
+                    assert_eq!(saved.image_gen.endpoint,"https://example.com/v1/images/generations");
+                    assert_eq!(saved.image_gen.model,"fixture-image-model");
+                    assert_eq!(saved.image_gen.timeout_seconds,77);
                     assert_eq!(saved.web.provider,hikari_runtime::web::SearchProvider::Exa);
                     for provider in SearchProvider::ALL {
                         let profile = saved.web.profile(provider);
@@ -445,7 +520,11 @@ fn chat_ui_interactions() {
                         }
                     }
                     app.config.web.provider=SearchProvider::Serper;
+                    app.settings_draft.image_model.update(cx,|state,cx|state.set_value("discard-me",window,cx));
+                    app.config.image_gen.enabled=false;
                     app.discard_settings(window,cx);
+                    assert!(app.config.image_gen.enabled);
+                    assert_eq!(app.settings_draft.image_model.read(cx).value().as_ref(),"fixture-image-model");
                     assert_eq!(app.config.web.provider,SearchProvider::Exa);
                     for provider in SearchProvider::ALL {
                         let draft = &app.settings_draft.web_profiles[provider.index()];
@@ -644,6 +723,7 @@ fn chat_ui_interactions() {
                 window.click("permission-mode", cx);
                 assert!(!BOUNDS.with(|map| map.borrow().contains_key("process-popover")));
                 execution.finish(None,false,Usage::default());
+                crate::execution_ui::tests::background_delegate_interactions(&view, window, cx);
                 view.update(cx,|app,cx|{app.save_sessions();cx.notify();});
                 assert_eq!(view.read(cx).session_store.load().unwrap()[0].execution.todos.len(),1);
                 cx.quit();

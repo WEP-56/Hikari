@@ -36,6 +36,15 @@ pub trait Tool: Send + Sync {
     ) -> std::result::Result<String, String> {
         self.call_with_abort(arguments, abort)
     }
+    fn call_output(
+        &self,
+        arguments: &str,
+        abort: &AtomicBool,
+        target: Option<&Path>,
+    ) -> Result<crate::ToolOutput, String> {
+        self.call_authorized(arguments, abort, target)
+            .map(crate::ToolOutput::text)
+    }
     fn output_limit(&self) -> usize {
         OUTPUT_CAP
     }
@@ -134,6 +143,74 @@ impl ToolRegistry {
         self.execution.as_ref()
     }
 
+    /// Child agents share implementations and the workspace, but never loaded-tool state,
+    /// parent conversation, memory access, or the parent's task-bound session tools.
+    pub fn fork_for_execution(
+        &self,
+        execution: Arc<crate::execution::Execution>,
+    ) -> std::result::Result<Self, String> {
+        let allowed = |name: &str| {
+            !matches!(
+                name,
+                "delegate_task"
+                    | "todo_list"
+                    | "clarify"
+                    | "process_manage"
+                    | "session_search"
+                    | "session_read"
+            ) && !crate::memory::is_memory_tool(name)
+        };
+        let mut fork = Self {
+            tools: self
+                .tools
+                .iter()
+                .filter(|t| allowed(t.name()))
+                .cloned()
+                .collect(),
+            defs: self
+                .defs
+                .iter()
+                .filter(|t| allowed(&t.name))
+                .cloned()
+                .collect(),
+            deferred: self
+                .deferred
+                .iter()
+                .filter(|(n, _)| allowed(n))
+                .map(|(n, v)| (n.clone(), v.clone()))
+                .collect(),
+            loaded: Mutex::new(Vec::new()),
+            artifacts: self.artifacts.clone(),
+            root: self.root.clone(),
+            execution: None,
+        };
+        fork.enable_execution(execution)?;
+        Ok(fork)
+    }
+
+    pub fn enable_delegation(
+        &mut self,
+        provider: Arc<dyn crate::Provider>,
+        system_prompt: String,
+        context_limit_tokens: u32,
+        attachments: Option<crate::AttachmentStore>,
+    ) -> std::result::Result<(), String> {
+        let execution = self.execution.clone().ok_or("委派需要会话执行底座")?;
+        let template = Arc::new(self.fork_for_execution(execution.clone())?);
+        self.register(Arc::new(crate::delegate::DelegateTool::new(
+            execution,
+            provider,
+            template,
+            system_prompt,
+            context_limit_tokens,
+            attachments,
+        )))
+    }
+
+    pub(crate) fn summary_output(&self, text: String) -> String {
+        self.finish_output(text, OUTPUT_CAP)
+    }
+
     pub fn defs(&self) -> &[ToolDef] {
         &self.defs
     }
@@ -203,12 +280,43 @@ impl ToolRegistry {
                         "{}\n[完整输出已保存：artifact_read id={id}，offset={cap}，共 {} 字符]",
                         text.chars().take(cap).collect::<String>(),
                         text.chars().count()
-                    )
+                    );
                 }
                 Err(e) => return format!("{}\n[完整输出保存失败：{e}]", cap_chars(&text, cap)),
             }
         }
         cap_chars(&text, cap)
+    }
+
+    // Rich results share one allowance, including the continuation marker itself.
+    fn finish_rich_text(&self, text: String, cap: usize) -> String {
+        if text.chars().count() <= cap {
+            return text;
+        }
+        let marker = match self.save_artifact(&text) {
+            Ok(id) => format!(
+                "\n[完整输出已保存：artifact_read id={id}，offset=0，共 {} 字符]",
+                text.chars().count()
+            ),
+            Err(note) => format!("\n[输出已截断；{note}]"),
+        };
+        let preview_cap = cap.saturating_sub(marker.chars().count());
+        text.chars()
+            .take(preview_cap)
+            .chain(marker.chars())
+            .take(cap)
+            .collect()
+    }
+
+    fn save_artifact(&self, text: &str) -> Result<String, &'static str> {
+        use sha2::{Digest, Sha256};
+        let root = self
+            .artifacts
+            .as_ref()
+            .ok_or("未启用 artifact 存储，完整结果不可恢复")?;
+        let id = format!("{:x}", Sha256::digest(text.as_bytes()));
+        fs::write(root.join(format!("{id}.txt")), text).map_err(|_| "完整结果保存失败")?;
+        Ok(id)
     }
 
     fn read_artifact(&self, arguments: &str) -> std::result::Result<String, String> {
@@ -259,15 +367,30 @@ impl ToolRegistry {
         name: &str,
         arguments: &str,
         abort: &AtomicBool,
-    ) -> std::result::Result<String, String> {
+    ) -> Result<String, String> {
+        self.call_output(name, arguments, abort).and_then(|output| {
+            if output.failure.is_some() {
+                Err(output.text)
+            } else {
+                Ok(output.text)
+            }
+        })
+    }
+    pub fn call_output(
+        &self,
+        name: &str,
+        arguments: &str,
+        abort: &AtomicBool,
+    ) -> std::result::Result<crate::ToolOutput, String> {
         if abort.load(Ordering::Relaxed) {
             return Err("已取消工具调用".into());
         }
         if name == "tool_search" {
-            return crate::tool_search::search(&self.defs, &self.deferred, &self.loaded, arguments);
+            return crate::tool_search::search(&self.defs, &self.deferred, &self.loaded, arguments)
+                .map(crate::ToolOutput::text);
         }
         if name == "artifact_read" {
-            return self.read_artifact(arguments);
+            return self.read_artifact(arguments).map(crate::ToolOutput::text);
         }
         if self.deferred.contains_key(name)
             && !self.loaded.lock().unwrap().iter().any(|n| n == name)
@@ -290,9 +413,26 @@ impl ToolRegistry {
                 .as_ref()
                 .map_or(Default::default(), |e| e.active_mode());
             let external_target = tool.target_path(arguments)?;
-            let (decision, resolved) = if name == "load_skill" {
+            let (decision, resolved) = if matches!(name, "load_skill" | "skill_manage") {
                 let path = external_target.as_ref().ok_or("Skill 目标路径无效")?;
-                crate::permission::assess(mode, root, "read_file", &json!({"path":path}))?
+                let (decision, target) = crate::permission::assess(
+                    mode,
+                    root,
+                    if name == "load_skill" || args["action"] == "history" {
+                        "read_file"
+                    } else {
+                        "write"
+                    },
+                    &json!({"path":path}),
+                )?;
+                (
+                    if name == "skill_manage" && args["action"] != "history" {
+                        crate::permission::Decision::Ask("Skill 管理将修改可执行指令及资源".into())
+                    } else {
+                        decision
+                    },
+                    target,
+                )
             } else {
                 crate::permission::assess(mode, root, name, &args)?
             };
@@ -300,7 +440,7 @@ impl ToolRegistry {
             match decision {
                 crate::permission::Decision::Allow => {}
                 crate::permission::Decision::Deny(reason) => {
-                    return Err(format!("硬性拦截：{reason}"))
+                    return Err(format!("硬性拦截：{reason}"));
                 }
                 crate::permission::Decision::Ask(reason) => {
                     let resources = if name == "shell" {
@@ -351,15 +491,76 @@ impl ToolRegistry {
             }
             if name == "shell" && args.get("background").and_then(Value::as_bool) == Some(true) {
                 let execution = self.execution.as_ref().ok_or("后台进程需要会话执行底座")?;
-                return execution.spawn_process(
-                    root.clone(),
-                    required_string(arguments, "command")?,
-                    abort,
-                );
+                return execution
+                    .spawn_process_with_resources(
+                        root.clone(),
+                        required_string(arguments, "command")?,
+                        abort,
+                        self.tools
+                            .iter()
+                            .filter(|tool| tool.name() == "load_skill")
+                            .cloned()
+                            .collect(),
+                    )
+                    .map(crate::ToolOutput::text);
             }
         }
-        tool.call_authorized(arguments, abort, target.as_deref())
-            .map(|s| self.finish_output(s, tool.output_limit()))
+        tool.call_output(arguments, abort, target.as_deref())
+            .map(|mut output| {
+                let cap = tool.output_limit();
+                let failure_chars = output.failure.as_ref().map_or(0, |failure| {
+                    serde_json::to_string(failure).unwrap().chars().count()
+                });
+                let structured_chars = output.structured.as_ref().map_or(0, |value| value.to_string().chars().count());
+                if failure_chars > cap / 4
+                    && failure_chars.saturating_add(structured_chars).saturating_add(output.text.chars().count()) > cap
+                {
+                    let failure = output.failure.as_mut().unwrap();
+                    let serialized = serde_json::to_string(failure).unwrap();
+                    failure.message = match self.save_artifact(&serialized) {
+                        Ok(id) => format!("完整错误已保存：artifact_read id={id} offset=0，共 {} 字符（JSON，包含 kind 和 message）。", serialized.chars().count()),
+                        Err(note) => format!("错误详情超过工具输出预算；{note}。"),
+                    };
+                    if serde_json::to_string(&failure.kind).unwrap().chars().count() > 256 {
+                        failure.kind = "truncated_failure".into();
+                    }
+                    output.truncated = true;
+                }
+                let failure_chars = output.failure.as_ref().map_or(0, |failure| {
+                    serde_json::to_string(failure).unwrap().chars().count()
+                });
+                if let Some(structured) = output.structured.as_ref() {
+                    let serialized = structured.to_string();
+                    let total_chars = serialized.chars().count();
+                    if total_chars.saturating_add(output.text.chars().count()).saturating_add(failure_chars) > cap {
+                        output.truncated = true;
+                        output.structured = Some(if let Some(root) = &self.artifacts {
+                            use sha2::{Digest, Sha256};
+                            let id = format!("{:x}", Sha256::digest(serialized.as_bytes()));
+                            match fs::write(root.join(format!("{id}.txt")), &serialized) {
+                                Ok(()) => json!({
+                                    "artifact_ref":{"tool":"artifact_read","id":id,"offset":0,"total_chars":total_chars,"format":"json"},
+                                    "note":"结构化结果超过工具输出预算，完整 JSON 已保存，可按字符分页读取。"
+                                }),
+                                Err(error) => json!({"truncated":true,"total_chars":total_chars,"note":format!("结构化结果超过工具输出预算，完整结果保存失败：{error}")}),
+                            }
+                        } else {
+                            json!({"truncated":true,"total_chars":total_chars,"note":"结构化结果超过工具输出预算；未启用 artifact 存储，完整结构化结果不可恢复。"})
+                        });
+                    }
+                }
+                // Count serialized failures too: MCP failures can duplicate the
+                // entire text in message or return an arbitrarily large kind.
+                let structured_chars = output.structured.as_ref().map_or(0, |value| value.to_string().chars().count());
+                let text_cap = cap.saturating_sub(structured_chars).saturating_sub(failure_chars);
+                output.truncated |= output.text.chars().count() > text_cap;
+                output.text = if output.structured.is_some() || output.failure.is_some() {
+                    self.finish_rich_text(output.text, text_cap)
+                } else {
+                    self.finish_output(output.text, text_cap)
+                };
+                output
+            })
             .map_err(|s| self.finish_output(s, OUTPUT_CAP))
     }
 

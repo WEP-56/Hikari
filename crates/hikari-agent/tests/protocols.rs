@@ -8,6 +8,223 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::AtomicBool;
 
+fn image_attachment(root: &std::path::Path) -> hikari_agent::Attachment {
+    hikari_agent::attachment::AttachmentStore::new(root.to_path_buf())
+        .import(
+            "preview.png",
+            "image/png",
+            b"\x89PNG\r\n\x1a\nfixture-image",
+        )
+        .unwrap()
+}
+
+fn wire_body(protocol: ApiProtocol, messages: &[Message]) -> Value {
+    request_body(
+        &ProviderConfig {
+            protocol,
+            ..Default::default()
+        },
+        &Context {
+            system_prompt: "base",
+            messages,
+            tools: &[],
+        },
+    )
+}
+
+fn block_of_type<'a>(blocks: &'a Value, kind: &str) -> &'a Value {
+    blocks
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|block| block["type"] == kind)
+        .unwrap()
+}
+
+#[test]
+fn image_only_user_input_uses_native_blocks_in_all_protocols() {
+    let root = tempfile::tempdir().unwrap();
+    let attachment = image_attachment(root.path());
+    let mut message = Message::user("");
+    message.set_attachments(vec![attachment.clone()]);
+    let data_url = attachment.data_url().unwrap();
+    let chat = wire_body(ApiProtocol::ChatCompletions, &[message.clone()]);
+    assert_eq!(
+        block_of_type(&chat["messages"][1]["content"], "image_url"),
+        &json!({"type":"image_url","image_url":{"url":data_url}})
+    );
+    let responses = wire_body(ApiProtocol::Responses, &[message.clone()]);
+    assert_eq!(
+        block_of_type(&responses["input"][0]["content"], "input_image"),
+        &json!({"type":"input_image","image_url":data_url})
+    );
+    let anthropic = wire_body(ApiProtocol::Anthropic, &[message]);
+    assert_eq!(
+        block_of_type(&anthropic["messages"][0]["content"], "image"),
+        &json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":data_url.split_once(',').unwrap().1}})
+    );
+    for content in [
+        &chat["messages"][1]["content"],
+        &responses["input"][0]["content"],
+        &anthropic["messages"][0]["content"],
+    ] {
+        assert!(content
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .any(|text| text.contains(&attachment.id)));
+        assert!(!content
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|block| block["text"] == ""));
+    }
+}
+
+#[test]
+fn chat_tool_images_follow_every_result_of_the_assistant_call_group() {
+    let root = tempfile::tempdir().unwrap();
+    let image = image_attachment(root.path());
+    let mut assistant = Message::assistant("");
+    if let Message::Assistant { tool_calls, .. } = &mut assistant {
+        *tool_calls = vec![
+            hikari_agent::ToolCall {
+                id: "image-call".into(),
+                name: "image_gen".into(),
+                arguments: "{}".into(),
+            },
+            hikari_agent::ToolCall {
+                id: "read-call".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            },
+        ];
+    }
+    let image_result = Message::with_output(
+        "image-call",
+        "image_gen",
+        hikari_agent::ToolOutput {
+            text: "generated".into(),
+            attachments: vec![image],
+            ..Default::default()
+        },
+    );
+    let messages = [
+        Message::user("go"),
+        assistant,
+        image_result,
+        Message::ToolCatalog { tools: vec![] },
+        Message::tool_result("read-call", "read", "read complete", false),
+        Message::assistant("finished"),
+    ];
+    let chat = wire_body(ApiProtocol::ChatCompletions, &messages);
+    let wire = chat["messages"].as_array().unwrap();
+    let roles: Vec<_> = wire
+        .iter()
+        .map(|item| item["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        roles,
+        [
+            "system",
+            "user",
+            "assistant",
+            "tool",
+            "tool",
+            "user",
+            "assistant"
+        ]
+    );
+    assert_eq!(wire[3]["tool_call_id"], "image-call");
+    assert_eq!(wire[4]["tool_call_id"], "read-call");
+    assert!(wire[5]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("image-call"));
+    assert_eq!(
+        block_of_type(&wire[5]["content"], "image_url")["type"],
+        "image_url"
+    );
+    // The same ordering must hold while awaiting the assistant's next response.
+    let pending = wire_body(ApiProtocol::ChatCompletions, &messages[..5]);
+    assert_eq!(pending["messages"][4]["role"], "tool");
+    assert_eq!(pending["messages"][5]["role"], "user");
+}
+
+#[test]
+fn rich_tool_result_preserves_failure_structured_data_and_native_images() {
+    let root = tempfile::tempdir().unwrap();
+    let image = image_attachment(root.path());
+    let result = Message::with_output(
+        "call-1",
+        "preview",
+        hikari_agent::ToolOutput {
+            text: "partial preview".into(),
+            structured: Some(json!({"verified":false,"pages":2})),
+            attachments: vec![image],
+            failure: Some(hikari_agent::ToolFailure {
+                kind: "provider_error".into(),
+                message: "partial response".into(),
+            }),
+            truncated: true,
+            retryable: false,
+        },
+    );
+    let restored: Message = serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+    assert_eq!(restored, result);
+    let chat = wire_body(ApiProtocol::ChatCompletions, &[restored.clone()]);
+    let responses = wire_body(ApiProtocol::Responses, &[restored.clone()]);
+    let anthropic = wire_body(ApiProtocol::Anthropic, &[restored]);
+    for text in [
+        chat["messages"][1]["content"].as_str().unwrap(),
+        responses["input"][0]["output"][0]["text"].as_str().unwrap(),
+        anthropic["messages"][0]["content"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    ] {
+        let metadata: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(metadata["text"], "partial preview");
+        assert_eq!(metadata["structured"], json!({"verified":false,"pages":2}));
+        assert_eq!(metadata["failure"]["kind"], "provider_error");
+        assert_eq!(metadata["is_error"], true);
+        assert_eq!(metadata["truncated"], true);
+        assert_eq!(metadata["retryable"], false);
+    }
+    assert_eq!(
+        block_of_type(&responses["input"][0]["output"], "input_image")["type"],
+        "input_image"
+    );
+    let anthropic_result = &anthropic["messages"][0]["content"][0];
+    assert_eq!(anthropic_result["is_error"], true);
+    assert_eq!(
+        block_of_type(&anthropic_result["content"], "image")["type"],
+        "image"
+    );
+}
+
+#[test]
+fn missing_and_changed_images_become_visible_text_without_sending_corrupt_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let image = image_attachment(root.path());
+    let mut message = Message::user("inspect");
+    message.set_attachments(vec![image.clone()]);
+    std::fs::write(&image.path, b"replaced").unwrap();
+    for protocol in [
+        ApiProtocol::ChatCompletions,
+        ApiProtocol::Responses,
+        ApiProtocol::Anthropic,
+    ] {
+        let body = wire_body(protocol, &[message.clone()]).to_string();
+        assert!(body.contains("附件内容已改变"));
+        assert!(!body.contains("base64"));
+    }
+    std::fs::remove_file(image.path).unwrap();
+    assert!(wire_body(ApiProtocol::Responses, &[message])
+        .to_string()
+        .contains("附件不可用"));
+}
+
 #[test]
 fn responses_fragmented_call_keeps_native_reasoning_and_replays_result() {
     let mut decoder = Decoder::new(ApiProtocol::Responses);
@@ -45,6 +262,7 @@ fn responses_fragmented_call_keeps_native_reasoning_and_replays_result() {
         .unwrap();
     let messages = [
         Message::User {
+            attachments: Vec::new(),
             origin: None,
             text: "读取".into(),
         },

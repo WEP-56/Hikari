@@ -1,5 +1,6 @@
 pub mod config;
 pub mod history;
+pub mod image_gen;
 pub mod imports;
 pub mod mcp;
 pub mod memory;

@@ -109,6 +109,7 @@ pub fn assess(
         "todo_list"
         | "clarify"
         | "process_manage"
+        | "delegate_task"
         | "tool_search"
         | "artifact_read"
         | "session_read"

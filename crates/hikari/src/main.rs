@@ -16,8 +16,8 @@ use gpui_kit::component::{
 use gpui_kit::prelude::{FluentBuilder as _, StatefulInteractiveElement as _};
 use gpui_kit::*;
 use hikari_agent::{
-    run_turn_with_control, AgentEvent, ConsolidateState, Message as AgentMessage, NullMemory,
-    ProtocolProvider, RetainState, ToolRegistry, TurnControl, TurnHost, TurnRequest, Usage,
+    run_turn_with_control, AgentEvent, Message as AgentMessage, NullMemory, ProtocolProvider,
+    ToolRegistry, TurnControl, TurnHost, TurnRequest, Usage,
 };
 use hikari_runtime::{
     AppConfig, ConfigStore, McpManager, McpServerConfig, McpStatus, McpTransport, MemoryCore,
@@ -25,7 +25,7 @@ use hikari_runtime::{
 };
 use settings_ui::{settings_card, settings_heading, settings_label, settings_row};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -33,6 +33,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
+mod attachments_ui;
 mod chat;
 mod execution_ui;
 mod memory_ui;
@@ -66,12 +67,14 @@ enum LineBody {
 }
 
 struct Line {
+    attachments: Vec<hikari_agent::Attachment>,
     body: LineBody,
 }
 
 impl Line {
     fn user(text: impl Into<SharedString>) -> Self {
         Self {
+            attachments: Vec::new(),
             body: LineBody::User(text.into()),
         }
     }
@@ -79,6 +82,7 @@ impl Line {
     #[cfg(test)]
     fn assistant(text: impl Into<SharedString>) -> Self {
         Self {
+            attachments: Vec::new(),
             body: LineBody::Assistant {
                 text: text.into(),
                 thinking: SharedString::new(""),
@@ -89,6 +93,7 @@ impl Line {
 
     fn pending() -> Self {
         Self {
+            attachments: Vec::new(),
             body: LineBody::Assistant {
                 text: "".into(),
                 thinking: SharedString::new(""),
@@ -99,6 +104,7 @@ impl Line {
 
     fn note(text: impl Into<SharedString>) -> Self {
         Self {
+            attachments: Vec::new(),
             body: LineBody::Note(text.into()),
         }
     }
@@ -189,6 +195,7 @@ struct Preview {
     workspace_store: hikari_runtime::workspace::WorkspaceStore,
     recent_workspaces: Vec<PathBuf>,
     workspace_notice: String,
+    notice_generation: u64,
     workspace_picker_generation: u64,
     sidebar: bool,
     sidebar_width: f32,
@@ -239,6 +246,7 @@ struct Preview {
     clarification: Entity<InputState>,
     new_permission: hikari_agent::permission::PermissionMode,
     conversation_drafts: std::collections::HashMap<Option<u64>, String>,
+    attachment_drafts: std::collections::HashMap<Option<u64>, Vec<hikari_agent::Attachment>>,
     search: Entity<InputState>,
     provider: Entity<InputState>,
     model: Entity<InputState>,
@@ -397,6 +405,9 @@ impl Preview {
             }
         });
         let draft_sub = cx.subscribe_in(&draft, window, |this, _, event, window, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.dismiss_composer_notice(cx);
+            }
             if let InputEvent::PressEnter { shift: false, .. } = event {
                 this.send(window, cx);
             }
@@ -408,6 +419,11 @@ impl Preview {
         });
 
         let (event_tx, event_rx) = mpsc::channel();
+        // Unsent image drafts are intentionally transient; persisted messages
+        // have already copied their resources into the owning session store.
+        if let Err(error) = session_store.remove_draft_artifacts() {
+            management_notice = error.message;
+        }
         let mut sessions = session_store.load().unwrap_or_else(|e| {
             management_notice = e.message;
             Vec::new()
@@ -447,6 +463,7 @@ impl Preview {
             workspace_store,
             recent_workspaces,
             workspace_notice: String::new(),
+            notice_generation: 0,
             workspace_picker_generation: 0,
             sidebar: true,
             sidebar_width: 292.,
@@ -497,6 +514,7 @@ impl Preview {
             clarification,
             new_permission: Default::default(),
             conversation_drafts: Default::default(),
+            attachment_drafts: Default::default(),
             search,
             provider,
             model,
@@ -566,9 +584,16 @@ impl Preview {
             return;
         }
         let text = self.draft.read(cx).value().trim().to_string();
-        if text.is_empty() {
+        if text.is_empty() && self.current_attachments().is_empty() {
             return;
         }
+        let text = if text.is_empty() {
+            "请查看图片。".to_string()
+        } else {
+            text
+        };
+        let attachments = self.current_attachments().to_vec();
+        let attachment_key = self.active.map(|idx| self.talks[idx].id);
         let cwd = self.agent_directory();
         if let Err(error) = self.prepare_agent_directory() {
             self.workspace_notice = error;
@@ -620,7 +645,18 @@ impl Preview {
         if self.talks[idx].lines.is_empty() {
             self.talks[idx].title = title_from(&text);
         }
-        self.talks[idx].lines.push(Line::user(&text));
+        let attachments = match self.save_input_attachments(talk_id, &attachments) {
+            Ok(attachments) => attachments,
+            Err(error) => {
+                self.workspace_notice = error;
+                cx.notify();
+                return;
+            }
+        };
+        self.attachment_drafts.remove(&attachment_key);
+        let mut user_line = Line::user(&text);
+        user_line.attachments = attachments.clone();
+        self.talks[idx].lines.push(user_line);
         let start = self.talks[idx].lines.len() - 1;
         self.talks[idx].view.start(start);
         self.talks[idx].lines.push(Line::pending());
@@ -628,6 +664,7 @@ impl Preview {
             self.talks[idx].retained_until = self.talks[idx].messages.len();
         }
         let mut user_message = AgentMessage::user(&text);
+        user_message.set_attachments(attachments);
         user_message.stamp(
             format!(
                 "talk-{talk_id}:{}",
@@ -726,13 +763,24 @@ impl Preview {
         self.save_sessions();
         self.start_pump(cx);
         let tx = self.event_tx.clone();
-        let skills = self.skills.clone();
+        // Skill roots follow the settings page (application root), not the
+        // default chat scratch directory under .hikari/chat.
+        let skill_roots = skill_search_roots(
+            &self.saved_config.skill_roots,
+            self.talks[idx].workspace.as_deref(),
+        );
+        let skills = SkillCatalog::discover(
+            Path::new("."),
+            &skill_roots,
+            &self.saved_config.disabled_skills,
+        );
         // Connections are bound to this turn's workspace, never retargeted by another session.
         let mcp = self.talks[idx].mcp.clone();
         let mcp_configs = self.saved_config.mcp_servers.clone();
         let runtime_tx = self.runtime_tx.clone();
         let max_tool_rounds = self.saved_config.max_tool_rounds;
         let web_config = self.saved_config.web.clone();
+        let image_config = self.saved_config.image_gen.clone();
         let history_store = self.session_store.clone();
         let history_core = self.memory_core.clone();
         let artifact_root = self
@@ -751,11 +799,19 @@ impl Preview {
             let _ = runtime_tx.send(RuntimeUpdate {
                 statuses: mcp.statuses(),
             });
-            let mut tools = ToolRegistry::workspace(cwd);
+            let attachments = hikari_agent::AttachmentStore::new(artifact_root.clone());
+            let mut tools = ToolRegistry::workspace(cwd.clone());
             let setup_error = tools
                 .enable_artifacts(artifact_root)
                 .and_then(|_| tools.enable_execution(execution.clone()))
                 .and_then(|_| hikari_runtime::web::register(web_config, &mut tools))
+                .and_then(|_| {
+                    hikari_runtime::image_gen::register(
+                        image_config,
+                        attachments.clone(),
+                        &mut tools,
+                    )
+                })
                 .and_then(|_| {
                     hikari_runtime::history::register(
                         history_store,
@@ -765,7 +821,8 @@ impl Preview {
                     )
                 })
                 .and_then(|_| skills.register(&mut tools))
-                .and_then(|_| mcp.register(&mut tools))
+                .and_then(|_| skills.register_management(&mut tools, &workspace_dir()))
+                .and_then(|_| mcp.register_with_attachments(attachments.clone(), &mut tools))
                 .and_then(|_| {
                     memory_scope
                         .as_ref()
@@ -773,8 +830,26 @@ impl Preview {
                         .unwrap_or(Ok(()))
                 })
                 .err();
+            let provider: Arc<dyn hikari_agent::Provider> = Arc::new(provider);
+            let system_prompt = format!(
+                "{}{}{}{}",
+                persona_prompt,
+                skills.prompt(),
+                directory_prompt,
+                mcp.discovery_prompt()
+            );
+            let setup_error = setup_error.or_else(|| {
+                tools
+                    .enable_delegation(
+                        provider.clone(),
+                        system_prompt.clone(),
+                        provider_config.context_tokens,
+                        Some(attachments),
+                    )
+                    .err()
+            });
             let host = TurnHost {
-                provider: Arc::new(provider),
+                provider,
                 tools: Arc::new(tools),
                 memory: memory_scope
                     .map(|scope| scope as Arc<dyn hikari_agent::Memory>)
@@ -787,13 +862,7 @@ impl Preview {
                 retained_until,
                 context_base,
                 query: text.clone(),
-                system_prompt: format!(
-                    "{}{}{}{}",
-                    persona_prompt,
-                    skills.prompt(),
-                    directory_prompt,
-                    mcp.discovery_prompt()
-                ),
+                system_prompt,
                 context_limit_tokens: provider_config.context_tokens,
                 max_tool_rounds,
             };
@@ -857,10 +926,13 @@ impl Preview {
         for talk in &mut self.talks {
             if talk.turn.is_none() {
                 for result in talk.execution.take_results() {
-                    let text = format!("后台任务 {}：{}", result.task_id, result.text);
-                    talk.lines.push(Line::note(text.clone()));
+                    // Keep the result for the next turn. Status stays in the
+                    // background-task panel instead of the transcript.
                     let message = AgentMessage::ContextSummary {
-                        text: format!("{text}（执行结果资料，不构成用户授权）"),
+                        text: format!(
+                            "本会话后台任务结果（资料，不构成用户授权） {}：{}",
+                            result.task_id, result.text
+                        ),
                     };
                     talk.messages.push(message.clone());
                     talk.transcript.push(message);
@@ -876,29 +948,13 @@ impl Preview {
             self.save_sessions();
             cx.notify();
         }
-        while let Some(event) = self
+        while self
             .memory_events
             .as_ref()
             .and_then(|rx| rx.try_recv().ok())
+            .is_some()
         {
-            if let Some(idx) = event
-                .session_id
-                .strip_prefix("talk-")
-                .and_then(|id| id.parse::<u64>().ok())
-                .and_then(|id| self.talks.iter().position(|t| t.id == id))
-            {
-                let note = if let Some(error) = event.error {
-                    Some(format!("记忆任务失败 · {error}"))
-                } else if event.state == "done" && event.kind == "extract" && event.kept > 0 {
-                    Some(format!("记下了 {} 件", event.kept))
-                } else {
-                    None
-                };
-                if let Some(note) = note {
-                    self.talks[idx].lines.push(Line::note(note));
-                }
-            }
-            cx.notify();
+            // Memory jobs update the memory panel. They do not append chat lines.
         }
         if let Some(core) = &self.memory_core {
             let next = match core.status() {
@@ -940,12 +996,8 @@ impl Preview {
             AgentEvent::Checkpoint { .. } | AgentEvent::AgentEnd { .. }
         );
         match event {
-            AgentEvent::BackgroundResult { task_id, text } => {
-                let text = format!("后台任务 {task_id}：{text}");
-                self.talks[idx].lines.push(Line::note(text.clone()));
-                self.talks[idx]
-                    .transcript
-                    .push(AgentMessage::ContextSummary { text });
+            AgentEvent::BackgroundResult { .. } => {
+                // The running turn already stores the summary in its checkpoint.
             }
             AgentEvent::Checkpoint {
                 messages,
@@ -956,12 +1008,14 @@ impl Preview {
                 self.talks[idx].retained_until = retained_until;
                 self.talks[idx].context_base = context_base;
             }
-            AgentEvent::MemoryError { error } => {
-                self.talks[idx].lines.push(Line::note(error));
-            }
-            AgentEvent::InputDelivered { text } => {
-                self.talks[idx].lines.push(Line::user(text.clone()));
-                self.talks[idx].transcript.push(AgentMessage::user(text));
+            AgentEvent::MemoryError { .. } => {}
+            AgentEvent::InputDelivered { text, attachments } => {
+                let mut line = Line::user(text.clone());
+                line.attachments = attachments.clone();
+                self.talks[idx].lines.push(line);
+                let mut message = AgentMessage::user(text);
+                message.set_attachments(attachments);
+                self.talks[idx].transcript.push(message);
             }
             AgentEvent::MessageStart { .. } => self.ensure_live(idx),
             AgentEvent::MessageUpdate { text, thinking } => {
@@ -1016,6 +1070,7 @@ impl Preview {
             } => {
                 self.close_empty_live(idx);
                 self.talks[idx].lines.push(Line {
+                    attachments: Vec::new(),
                     body: LineBody::Tool {
                         id: tool_call_id,
                         name: tool_name.into(),
@@ -1027,20 +1082,21 @@ impl Preview {
                 });
             }
             AgentEvent::ToolExecutionEnd {
+                output,
                 tool_call_id,
                 tool_name,
                 text,
                 is_error,
             } => {
-                self.talks[idx].transcript.push(AgentMessage::tool_result(
+                self.talks[idx].transcript.push(AgentMessage::with_output(
                     &tool_call_id,
                     &tool_name,
-                    &text,
-                    is_error,
+                    output.clone(),
                 ));
                 if let Some(line) = self.talks[idx].lines.iter_mut().rev().find(
                     |line| matches!(&line.body, LineBody::Tool { id, .. } if id == &tool_call_id),
                 ) {
+                    line.attachments = output.attachments;
                     if let LineBody::Tool {
                         detail,
                         running,
@@ -1054,36 +1110,9 @@ impl Preview {
                     }
                 }
             }
-            AgentEvent::MemoryRecall { items, .. } => {
-                if !items.is_empty() {
-                    let text = items
-                        .iter()
-                        .map(|item| item.text.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" · ");
-                    self.insert_before_live(idx, Line::note(format!("想起了 · {text}")));
-                }
-            }
-            AgentEvent::MemoryRetain {
-                state, error, kept, ..
-            } => {
-                let note = match state {
-                    RetainState::Failed => Some(format!("没记下。{}", error.unwrap_or_default())),
-                    RetainState::Done if kept > 0 => Some(format!("记下了 {kept} 件")),
-                    _ => None,
-                };
-                if let Some(note) = note {
-                    self.insert_before_live(idx, Line::note(note));
-                }
-            }
-            AgentEvent::MemoryConsolidation { state, error, .. } => {
-                if state == ConsolidateState::Failed {
-                    self.insert_before_live(
-                        idx,
-                        Line::note(format!("沉淀没完成。{}", error.unwrap_or_default())),
-                    );
-                }
-            }
+            AgentEvent::MemoryRecall { .. }
+            | AgentEvent::MemoryRetain { .. }
+            | AgentEvent::MemoryConsolidation { .. } => {}
             AgentEvent::AutoCompactionStart { .. } => {
                 self.insert_before_live(idx, Line::note("在把更早的对话收起来"));
             }
@@ -1124,14 +1153,30 @@ impl Preview {
                         .talks
                         .iter()
                         .find_map(|t| t.turn.as_ref().map(|t| t.abort.clone()));
-                    let pending = control.drain_pending();
+                    let pending = control.drain_pending_messages();
                     if !pending.is_empty() {
                         self.management_notice =
                             format!("{} 条排队输入未执行，已保留在会话旁注", pending.len());
+                        // Preserve unsent images in this conversation's composer.
+                        let drafts = self
+                            .attachment_drafts
+                            .entry(Some(self.talks[idx].id))
+                            .or_default();
+                        for message in &pending {
+                            for attachment in message.attachments() {
+                                if !drafts.iter().any(|a| a.id == attachment.id) {
+                                    drafts.push(attachment.clone());
+                                }
+                            }
+                        }
                         // No window is available in the event pump; preserve the text as a note.
                         self.talks[idx].lines.push(Line::note(format!(
                             "尚未执行的输入：{}",
-                            pending.join("\n")
+                            pending
+                                .iter()
+                                .map(|m| m.text())
+                                .collect::<Vec<_>>()
+                                .join("\n")
                         )));
                     }
                 }
@@ -1243,11 +1288,18 @@ fn talk_from_session(session: Session) -> Talk {
         .transcript
         .iter()
         .filter_map(|message| match message {
-            AgentMessage::User { text, .. } => Some(Line::user(text.clone())),
+            AgentMessage::User {
+                text, attachments, ..
+            } => {
+                let mut line = Line::user(text.clone());
+                line.attachments = attachments.clone();
+                Some(line)
+            }
             AgentMessage::Assistant { text, thinking, .. }
                 if !text.is_empty() || !thinking.is_empty() =>
             {
                 Some(Line {
+                    attachments: Vec::new(),
                     body: LineBody::Assistant {
                         text: text.clone().into(),
                         thinking: thinking.clone().into(),
@@ -1262,6 +1314,7 @@ fn talk_from_session(session: Session) -> Talk {
                 is_error,
                 ..
             } => Some(Line {
+                attachments: message.attachments().to_vec(),
                 body: LineBody::Tool {
                     id: tool_call_id.clone(),
                     name: name.clone().into(),
@@ -1276,7 +1329,10 @@ fn talk_from_session(session: Session) -> Talk {
                     error: *is_error,
                 },
             }),
-            AgentMessage::ContextSummary { text } => Some(Line::note(text.clone())),
+            AgentMessage::ContextSummary { text } if !quiet_status(text) => {
+                Some(Line::note(text.clone()))
+            }
+            AgentMessage::ContextSummary { .. } => None,
             AgentMessage::ToolCatalog { .. } | AgentMessage::Assistant { .. } => None,
         })
         .collect();
@@ -1950,6 +2006,19 @@ impl Preview {
                     // TextareaState controls the height: it grows from one row to
                     // six rows, then keeps the composer size stable and scrolls
                     // the editor internally.
+                    .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                        this.attach_paths(&paths.0, cx)
+                    }))
+                    .capture_action(cx.listener(
+                        |this, _: &gpui_kit::component::input::Paste, _, cx| {
+                            if this.paste_images(cx) {
+                                cx.stop_propagation();
+                            }
+                        },
+                    ))
+                    .when(!self.current_attachments().is_empty(), |this| {
+                        this.child(self.attachment_draft_view(cx))
+                    })
                     .child(Textarea::new(&self.draft).appearance(false))
                     .child(
                         h_flex()
@@ -1963,7 +2032,8 @@ impl Preview {
                                         "attach",
                                         IconName::Plus,
                                         cx.listener(|this, _, window, cx| {
-                                            this.new_conversation(window, cx)
+                                            let _ = window;
+                                            this.choose_images(cx)
                                         }),
                                     ))
                                     .child(self.run_config(cx)),
@@ -2165,6 +2235,54 @@ enum OpenTarget {
     Explorer,
     Code,
     Bash,
+}
+
+/// Background results, sub-agent callbacks, and memory bookkeeping stay out of
+/// the transcript. The task panel and memory page already show them.
+fn quiet_status(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with("后台任务")
+        || text.contains("后台任务结果")
+        || text.starts_with("记下了")
+        || text.starts_with("想起了")
+        || text.starts_with("记忆任务")
+        || text.starts_with("没记下")
+        || text.starts_with("沉淀没完成")
+        || text.starts_with("检索失败")
+}
+
+/// Relative skill roots resolve from the application root, matching Settings.
+/// An explicitly selected project workspace is searched as well. The default
+/// chat directory is not a workspace and must not nest another `.hikari/skills`.
+fn skill_search_roots(configured: &[PathBuf], workspace: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for root in configured {
+        if root.is_absolute() {
+            if !roots.contains(root) {
+                roots.push(root.clone());
+            }
+            continue;
+        }
+        let app = workspace_dir().join(root);
+        if !roots.contains(&app) {
+            roots.push(app);
+        }
+        if let Some(workspace) = workspace {
+            let project = workspace.join(root);
+            if !roots.contains(&project) {
+                roots.push(project);
+            }
+        }
+    }
+    roots
+}
+
+fn skill_root_label(path: &Path) -> String {
+    if path.is_absolute() {
+        path.display().to_string()
+    } else {
+        workspace_dir().join(path).display().to_string()
+    }
 }
 
 /// 应用根目录：源码构建是仓库根目录，安装包运行时可执行文件所在目录。
@@ -2457,7 +2575,7 @@ fn side_row(
 impl Preview {
     fn queue_input(&mut self, steering: bool, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.draft.read(cx).value().trim().to_string();
-        if text.is_empty() {
+        if text.is_empty() && self.current_attachments().is_empty() {
             return;
         }
         let Some(control) = self.active_control() else {
@@ -2465,11 +2583,30 @@ impl Preview {
             cx.notify();
             return;
         };
-        if steering {
-            control.steer(text);
+        let key = self.active.map(|i| self.talks[i].id);
+        let Some(id) = key else {
+            return;
+        };
+        let attachments = match self.save_input_attachments(id, self.current_attachments()) {
+            Ok(attachments) => attachments,
+            Err(error) => {
+                self.workspace_notice = error;
+                cx.notify();
+                return;
+            }
+        };
+        let mut message = AgentMessage::user(if text.is_empty() {
+            "请查看图片。".into()
         } else {
-            control.follow_up(text);
+            text
+        });
+        message.set_attachments(attachments);
+        if steering {
+            control.steer_message(message);
+        } else {
+            control.follow_up_message(message);
         }
+        self.attachment_drafts.remove(&key);
         self.draft
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.conversation_drafts
@@ -2886,7 +3023,8 @@ impl Preview {
                                         .flex_1()
                                         .min_w_0()
                                         .text_xs()
-                                        .child(path.display().to_string()),
+                                        .truncate()
+                                        .child(skill_root_label(path)),
                                 )
                                 .child(
                                     Button::new(SharedString::from(format!(

@@ -2856,6 +2856,7 @@ dependencies = [
 name = "hikari-runtime"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "hikari-agent",
  "hikari-memory",
  "html2text",
@@ -2863,6 +2864,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "tempfile",
  "toml 0.8.23",
  "ureq",

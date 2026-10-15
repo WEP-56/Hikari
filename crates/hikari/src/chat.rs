@@ -134,30 +134,73 @@ impl Preview {
                 let mut children = Vec::new();
                 if let Some(user) = turn.user {
                     if let LineBody::User(text) = &talk.lines[user].body {
+                        let images: Vec<_> = talk.lines[user]
+                            .attachments
+                            .iter()
+                            .enumerate()
+                            .map(|(i, attachment)| {
+                                (
+                                    format!("user-image-{}-{user}-{i}", talk.id),
+                                    attachment.clone(),
+                                )
+                            })
+                            .collect();
+                        let mut bubble = div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .min_w_0()
+                            .max_w(relative(0.85))
+                            .px_4()
+                            .py_3()
+                            .rounded_xl()
+                            .bg(ink.hover);
+                        if !images.is_empty() {
+                            bubble = bubble.child(crate::attachments_ui::attachment_strip(
+                                &images,
+                                format!("user-images-{}-{user}", talk.id),
+                                cx,
+                            ));
+                        }
                         children.push(
                             h_flex()
                                 .w_full()
                                 .justify_end()
-                                .child(
-                                    div()
-                                        .max_w(relative(0.85))
-                                        .px_4()
-                                        .py_3()
-                                        .rounded_xl()
-                                        .bg(ink.hover)
-                                        .child(plain_text(
-                                            format!("user-{}-{user}", talk.id),
-                                            text,
-                                            ink,
-                                            &self.config.appearance,
-                                        )),
-                                )
+                                .child(bubble.child(plain_text(
+                                    format!("user-{}-{user}", talk.id),
+                                    text,
+                                    ink,
+                                    &self.config.appearance,
+                                )))
                                 .into_any_element(),
                         );
                     }
                 }
                 if !turn.activity.is_empty() || (turn.running && turn.answer.is_none()) {
                     children.push(self.process(idx, &turn, ink, cx));
+                    let talk_id = talk.id;
+                    let images: Vec<_> = turn
+                        .activity
+                        .iter()
+                        .flat_map(|index| {
+                            let index = *index;
+                            talk.lines[index].attachments.iter().enumerate().map(
+                                move |(i, attachment)| {
+                                    (
+                                        format!("tool-image-{talk_id}-{index}-{i}"),
+                                        attachment.clone(),
+                                    )
+                                },
+                            )
+                        })
+                        .collect();
+                    if !images.is_empty() {
+                        children.push(crate::attachments_ui::attachment_strip(
+                            &images,
+                            format!("tool-images-{}-{}", talk.id, turn.start),
+                            cx,
+                        ));
+                    }
                 }
                 if let Some(answer) = turn.answer {
                     if let LineBody::Assistant { text, live, .. } = &talk.lines[answer].body {
@@ -179,6 +222,9 @@ impl Preview {
                 }
                 for note in turn.notes {
                     if let LineBody::Note(text) = &talk.lines[note].body {
+                        if super::quiet_status(text) {
+                            continue;
+                        }
                         children.push(
                             div()
                                 .text_sm()

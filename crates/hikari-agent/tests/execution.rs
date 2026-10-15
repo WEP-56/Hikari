@@ -25,6 +25,65 @@ fn registry(root: &std::path::Path, session: &str) -> (Arc<Execution>, Arc<ToolR
 }
 
 #[test]
+fn background_process_retains_skill_resources_until_monitor_finishes() {
+    struct Resource(Arc<AtomicBool>);
+    impl hikari_agent::tool::Tool for Resource {
+        fn name(&self) -> &str {
+            "load_skill"
+        }
+        fn description(&self) -> &str {
+            "fixture resource lease"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object"})
+        }
+        fn call(&self, _: &str) -> Result<String, String> {
+            Ok(String::new())
+        }
+    }
+    impl Drop for Resource {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (execution, _) = registry(root.path(), "resource-lease");
+    let released = Arc::new(AtomicBool::new(false));
+    let resource: Arc<dyn hikari_agent::tool::Tool> = Arc::new(Resource(released.clone()));
+    #[cfg(windows)]
+    let command = "ping -n 30 127.0.0.1 > nul";
+    #[cfg(not(windows))]
+    let command = "sleep 30";
+    let output = execution
+        .spawn_process_with_resources(
+            root.path().to_owned(),
+            command.into(),
+            &AtomicBool::new(false),
+            vec![resource.clone()],
+        )
+        .unwrap();
+    let id = serde_json::from_str::<Value>(&output).unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    drop(resource);
+    execution.finish(None, false, Usage::default());
+    assert!(
+        !released.load(Ordering::Acquire),
+        "Completing the parent must retain background skill files"
+    );
+    execution.stop(&id).unwrap();
+    wait_for(|| {
+        execution
+            .snapshot()
+            .tasks
+            .iter()
+            .any(|task| task.task_id == id && task.status.terminal())
+    });
+    wait_for(|| released.load(Ordering::Acquire));
+}
+
+#[test]
 fn permission_policy_covers_wrappers_compounds_and_catastrophic_targets() {
     let root = tempfile::tempdir().unwrap();
     for mode in [PermissionMode::Careful, PermissionMode::Autonomous] {

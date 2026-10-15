@@ -358,12 +358,14 @@ fn checkpoint_copies_followup_and_tool_provenance_to_transcript() {
 
 #[test]
 fn artifact_cleanup_is_limited_to_the_deleted_session() {
+    use sha2::{Digest, Sha256};
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::new(dir.path());
     for id in [1, 2] {
         let root = dir.path().join("artifacts").join(format!("talk-{id}"));
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join(format!("{}.txt", "a".repeat(64))), "artifact").unwrap();
+        let hash = format!("{:x}", Sha256::digest(b"artifact"));
+        std::fs::write(root.join(format!("{hash}.txt")), "artifact").unwrap();
     }
     store.remove_artifacts(1).unwrap();
     assert!(!dir.path().join("artifacts/talk-1").exists());

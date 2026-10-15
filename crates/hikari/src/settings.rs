@@ -41,6 +41,9 @@ pub(super) struct SettingsDraft {
     tool_disclosure: hikari_agent::protocols::ToolDisclosure,
     pub(super) web_profiles: [WebDraft; 3],
     web_timeout: Entity<InputState>,
+    pub(super) image_profile: WebDraft,
+    pub(super) image_model: Entity<InputState>,
+    pub(super) image_timeout: Entity<InputState>,
     fonts: Vec<Entity<InputState>>,
     font_selects: Vec<Entity<FontSelect>>,
     custom_fonts: [bool; 3],
@@ -214,6 +217,17 @@ impl SettingsDraft {
                 }
             }),
             web_timeout: input(config.web.timeout_seconds.to_string(), window, cx),
+            image_profile: WebDraft {
+                key: cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .masked(true)
+                        .default_value(config.image_gen.api_key.clone())
+                }),
+                env: input(config.image_gen.api_key_env.clone(), window, cx),
+                endpoint: input(config.image_gen.endpoint.clone(), window, cx),
+            },
+            image_model: input(config.image_gen.model.clone(), window, cx),
+            image_timeout: input(config.image_gen.timeout_seconds.to_string(), window, cx),
             fonts,
             font_selects,
             custom_fonts: [false; 3],
@@ -247,6 +261,7 @@ impl Preview {
         let profile = &self.settings_draft.web_profiles[self.config.web.provider.index()];
         let content = v_flex()
             .gap_4()
+            .child(settings_heading("网页搜索"))
             .child(
                 Switch::new("web-enabled")
                     .label("启用网页搜索")
@@ -321,10 +336,42 @@ impl Preview {
                 "各提供商配置独立保存；搜索使用选中的提供商。地址留空使用默认接口，密钥留空读取环境变量。",
                 cx,
             ));
+        let image = &self.settings_draft.image_profile;
+        let image_content = v_flex()
+            .gap_4()
+            .child(settings_heading("图片生成"))
+            .child(
+                Switch::new("image-gen-enabled")
+                    .label("启用图片生成")
+                    .checked(self.config.image_gen.enabled)
+                    .on_change(cx.listener(|this, enabled, _, cx| {
+                        this.config.image_gen.enabled = *enabled;
+                        this.settings_dirty = true;
+                        cx.notify();
+                    })),
+            )
+            .child(settings_row("API Key", Input::new(&image.key), cx))
+            .child(settings_row("密钥环境变量", Input::new(&image.env), cx))
+            .child(settings_row("生成接口地址", Input::new(&image.endpoint), cx))
+            .child(settings_row(
+                "图片模型",
+                Input::new(&self.settings_draft.image_model),
+                cx,
+            ))
+            .child(settings_row(
+                "超时（秒）",
+                Input::new(&self.settings_draft.image_timeout),
+                cx,
+            ))
+            .child(settings_label(
+                "支持 OpenAI 兼容图片生成接口；请填写完整地址（包含 /images/generations）。密钥留空读取环境变量。生成可能收费，失败或超时不会自动重试。",
+                cx,
+            ));
         v_flex()
             .gap_4()
             .child(settings_heading("其它提供商"))
             .child(settings_card(content, cx))
+            .child(settings_card(image_content, cx))
     }
     #[cfg(test)]
     pub(super) fn verify_provider_key_persistence(
@@ -870,6 +917,11 @@ impl Preview {
             self.settings_draft.model_name.clone(),
             self.settings_draft.levels.clone(),
             self.settings_draft.web_timeout.clone(),
+            self.settings_draft.image_profile.key.clone(),
+            self.settings_draft.image_profile.env.clone(),
+            self.settings_draft.image_profile.endpoint.clone(),
+            self.settings_draft.image_model.clone(),
+            self.settings_draft.image_timeout.clone(),
         ];
         for profile in &self.settings_draft.web_profiles {
             inputs.extend([
@@ -938,6 +990,12 @@ impl Preview {
             profile.endpoint = read(&draft.endpoint, cx);
         }
         config.web.timeout_seconds = number(&self.settings_draft.web_timeout, "Web 超时", cx)?;
+        config.image_gen.api_key = read(&self.settings_draft.image_profile.key, cx);
+        config.image_gen.api_key_env = read(&self.settings_draft.image_profile.env, cx);
+        config.image_gen.endpoint = read(&self.settings_draft.image_profile.endpoint, cx);
+        config.image_gen.model = read(&self.settings_draft.image_model, cx);
+        config.image_gen.timeout_seconds =
+            number(&self.settings_draft.image_timeout, "图片生成超时", cx)?;
         config.sync_active()?;
         config.validate()?;
         Ok(config)
@@ -1086,6 +1144,20 @@ impl Preview {
         self.settings_draft.web_timeout.update(cx, |state, cx| {
             state.set_value(self.config.web.timeout_seconds.to_string(), window, cx)
         });
+        let image = &self.config.image_gen;
+        let draft = &self.settings_draft.image_profile;
+        for (state, value) in [
+            (draft.key.clone(), image.api_key.clone()),
+            (draft.env.clone(), image.api_key_env.clone()),
+            (draft.endpoint.clone(), image.endpoint.clone()),
+            (self.settings_draft.image_model.clone(), image.model.clone()),
+            (
+                self.settings_draft.image_timeout.clone(),
+                image.timeout_seconds.to_string(),
+            ),
+        ] {
+            state.update(cx, |state, cx| state.set_value(value, window, cx));
+        }
         self.settings_draft
             .rounds
             .update(cx, |state, cx| state.set_value(rounds, window, cx));

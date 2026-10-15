@@ -1,4 +1,6 @@
 //! MCP client: initialize, paginated discovery, tools/call, cancellation and connection lifetime.
+use base64::{engine::general_purpose::STANDARD, Engine};
+use hikari_agent::attachment::{AttachmentStore, ToolFailure, ToolOutput, MAX_ATTACHMENT_BYTES};
 use hikari_agent::tool::Tool;
 use hikari_agent::{AgentError, Result, ToolRegistry};
 use serde::{Deserialize, Serialize};
@@ -253,6 +255,20 @@ impl McpManager {
         }
     }
     pub fn register(&self, registry: &mut ToolRegistry) -> std::result::Result<(), String> {
+        self.register_inner(None, registry)
+    }
+    pub fn register_with_attachments(
+        &self,
+        store: AttachmentStore,
+        registry: &mut ToolRegistry,
+    ) -> std::result::Result<(), String> {
+        self.register_inner(Some(store), registry)
+    }
+    fn register_inner(
+        &self,
+        store: Option<AttachmentStore>,
+        registry: &mut ToolRegistry,
+    ) -> std::result::Result<(), String> {
         for connection in self.connections.lock().unwrap().values() {
             for def in &connection.tools {
                 registry.register_deferred(
@@ -260,6 +276,7 @@ impl McpManager {
                         def: def.clone(),
                         client: connection.client.clone(),
                         namespace: connection.config.name.clone(),
+                        store: store.clone(),
                     }),
                     format!("{} {}", connection.config.name, connection.instructions),
                 )?;
@@ -350,6 +367,7 @@ struct RemoteTool {
     def: RemoteToolDef,
     client: Arc<Mutex<Client>>,
     namespace: String,
+    store: Option<AttachmentStore>,
 }
 impl Tool for RemoteTool {
     fn name(&self) -> &str {
@@ -369,6 +387,19 @@ impl Tool for RemoteTool {
         arguments: &str,
         abort: &AtomicBool,
     ) -> std::result::Result<String, String> {
+        let output = self.call_output(arguments, abort, None)?;
+        if output.failure.is_some() {
+            Err(output.text)
+        } else {
+            Ok(output.text)
+        }
+    }
+    fn call_output(
+        &self,
+        arguments: &str,
+        abort: &AtomicBool,
+        _target: Option<&Path>,
+    ) -> std::result::Result<ToolOutput, String> {
         let args: Value = serde_json::from_str(arguments).map_err(|e| e.to_string())?;
         let mut client = self.client.lock().map_err(|_| "MCP 连接已失效")?;
         let current = discover(&mut client, &self.namespace, abort).map_err(|e| e.message)?;
@@ -385,31 +416,103 @@ impl Tool for RemoteTool {
                 abort,
             )
             .map_err(|e| e.message)?;
-        let mut text = result["content"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|block| {
-                if block["type"] == "text" {
-                    block["text"].as_str().unwrap_or("").to_string()
-                } else {
-                    format!(
-                        "[MCP {} content]",
-                        block["type"].as_str().unwrap_or("unknown")
-                    )
+        convert_tool_result(&result, self.store.as_ref())
+    }
+}
+
+fn convert_tool_result(
+    result: &Value,
+    store: Option<&AttachmentStore>,
+) -> std::result::Result<ToolOutput, String> {
+    let mut output = ToolOutput::default();
+    let mut texts = Vec::new();
+    for (index, block) in result["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let kind = block["type"].as_str().unwrap_or("unknown");
+        let (data, mime, name) = match kind {
+            "text" => {
+                texts.push(block["text"].as_str().unwrap_or("").to_owned());
+                continue;
+            }
+            "image" | "audio" => (
+                block["data"].as_str(),
+                block["mimeType"]
+                    .as_str()
+                    .unwrap_or("application/octet-stream"),
+                format!("mcp-{kind}-{index}"),
+            ),
+            "resource" => {
+                let resource = &block["resource"];
+                if let Some(text) = resource["text"].as_str() {
+                    texts.push(format!(
+                        "[MCP resource {}]\n{text}",
+                        resource["uri"].as_str().unwrap_or("")
+                    ));
+                    continue;
                 }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if let Some(structured) = result.get("structuredContent") {
-            text.push_str(&format!("\n{structured}"));
-        }
-        if result["isError"].as_bool().unwrap_or(false) {
-            Err(text)
+                let name = resource["uri"]
+                    .as_str()
+                    .unwrap_or("mcp-resource")
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("mcp-resource")
+                    .to_owned();
+                (
+                    resource["blob"].as_str(),
+                    resource["mimeType"]
+                        .as_str()
+                        .unwrap_or("application/octet-stream"),
+                    name,
+                )
+            }
+            "resource_link" => {
+                texts.push(format!(
+                    "[MCP resource link] {} {}",
+                    block["name"].as_str().unwrap_or(""),
+                    block["uri"].as_str().unwrap_or("")
+                ));
+                continue;
+            }
+            _ => {
+                texts.push(format!("[MCP {kind} content]"));
+                continue;
+            }
+        };
+        if let (Some(store), Some(data)) = (store, data) {
+            if data.len() > MAX_ATTACHMENT_BYTES.div_ceil(3) * 4 {
+                return Err("MCP 附件超过 20 MiB 限制".into());
+            }
+            let bytes = STANDARD
+                .decode(data)
+                .map_err(|_| "MCP 附件 base64 无效".to_string())?;
+            let attachment = store.import(&name, mime, &bytes)?;
+            texts.push(format!(
+                "[MCP attachment {}: {} ({})]",
+                attachment.id, attachment.name, attachment.mime_type
+            ));
+            output.attachments.push(attachment);
         } else {
-            Ok(text)
+            texts.push(format!("[MCP {kind} content: 附件存储未启用或缺少数据]"));
         }
     }
+    output.structured = result.get("structuredContent").cloned();
+    if let Some(structured) = &output.structured {
+        texts.push(structured.to_string());
+    }
+    output.text = texts.join("\n");
+    if result["isError"].as_bool().unwrap_or(false) {
+        output.failure = Some(ToolFailure {
+            kind: "mcp_tool_error".into(),
+            message: output.text.clone(),
+        });
+    }
+    // MCP metadata cannot establish that replaying a tool is safe.
+    output.retryable = false;
+    Ok(output)
 }
 
 struct Client {
@@ -714,4 +817,55 @@ fn redacted_http_error(error: ureq::Error, token: &str) -> AgentError {
         message = message.replace(token, "•••");
     }
     AgentError::new(message)
+}
+
+#[cfg(test)]
+mod rich_output_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_structured_content_images_resources_and_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::new(root.path().to_path_buf());
+        let png = b"\x89PNG\r\n\x1a\nfixture";
+        let result = json!({"content":[
+            {"type":"text","text":"a generated preview"},
+            {"type":"image","mimeType":"image/png","data":STANDARD.encode(png)},
+            {"type":"resource","resource":{"uri":"memory://results/report.txt","mimeType":"text/plain","blob":STANDARD.encode(b"complete report")}},
+            {"type":"resource","resource":{"uri":"memory://results/note","text":"readable note"}},
+            {"type":"resource_link","uri":"https://example.test/remote","name":"remote report"}
+        ],"structuredContent":{"count":2},"isError":true});
+        let output = convert_tool_result(&result, Some(&store)).unwrap();
+        assert_eq!(output.attachments.len(), 2);
+        assert_eq!(output.attachments[0].mime_type, "image/png");
+        assert_eq!(std::fs::read(&output.attachments[0].path).unwrap(), png);
+        assert_eq!(output.attachments[1].name, "report.txt");
+        assert_eq!(
+            std::fs::read(&output.attachments[1].path).unwrap(),
+            b"complete report"
+        );
+        assert_eq!(output.structured, Some(json!({"count":2})));
+        assert_eq!(output.failure.unwrap().kind, "mcp_tool_error");
+        assert!(output.text.contains("readable note"));
+        assert!(output.text.contains("https://example.test/remote"));
+        assert!(!output.text.contains(&STANDARD.encode(png)));
+        assert!(!output.retryable);
+    }
+
+    #[test]
+    fn legacy_registration_does_not_inline_binary_and_invalid_images_are_rejected() {
+        let result =
+            json!({"content":[{"type":"image","mimeType":"image/png","data":"aW52YWxpZA=="}]});
+        let output = convert_tool_result(&result, None).unwrap();
+        assert!(output.attachments.is_empty());
+        assert!(!output.text.contains("aW52YWxpZA=="));
+        let root = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::new(root.path().to_path_buf());
+        assert!(convert_tool_result(&result, Some(&store)).is_err());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        let corrupt = json!({"content":[{"type":"resource","resource":{"blob":"%invalid%"}}]});
+        assert!(convert_tool_result(&corrupt, Some(&store))
+            .unwrap_err()
+            .contains("base64"));
+    }
 }

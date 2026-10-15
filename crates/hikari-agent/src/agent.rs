@@ -32,26 +32,42 @@ pub struct TurnRequest {
 /// Pi's steering/follow-up boundary: steering after tools, follow-up after a reply.
 #[derive(Default)]
 pub struct TurnControl {
-    queues: Mutex<(VecDeque<String>, VecDeque<String>)>,
+    queues: Mutex<(VecDeque<Message>, VecDeque<Message>)>,
 }
 impl TurnControl {
     pub fn steer(&self, text: impl Into<String>) {
-        self.queues.lock().unwrap().0.push_back(text.into());
+        self.steer_message(Message::user(text));
     }
     pub fn follow_up(&self, text: impl Into<String>) {
-        self.queues.lock().unwrap().1.push_back(text.into());
+        self.follow_up_message(Message::user(text));
+    }
+    pub fn steer_message(&self, message: Message) {
+        if matches!(message, Message::User { .. }) {
+            self.queues.lock().unwrap().0.push_back(message);
+        }
+    }
+    pub fn follow_up_message(&self, message: Message) {
+        if matches!(message, Message::User { .. }) {
+            self.queues.lock().unwrap().1.push_back(message);
+        }
     }
     pub fn pending(&self) -> usize {
         let queues = self.queues.lock().unwrap();
         queues.0.len() + queues.1.len()
     }
-    fn take_steering(&self) -> Vec<String> {
+    fn take_steering(&self) -> Vec<Message> {
         self.queues.lock().unwrap().0.drain(..).collect()
     }
-    fn take_follow_up(&self) -> Option<String> {
+    fn take_follow_up(&self) -> Option<Message> {
         self.queues.lock().unwrap().1.pop_front()
     }
     pub fn drain_pending(&self) -> Vec<String> {
+        self.drain_pending_messages()
+            .into_iter()
+            .map(|m| m.text().to_owned())
+            .collect()
+    }
+    pub fn drain_pending_messages(&self) -> Vec<Message> {
         let mut queues = self.queues.lock().unwrap();
         let mut pending: Vec<_> = queues.0.drain(..).collect();
         pending.extend(queues.1.drain(..));
@@ -68,6 +84,7 @@ pub enum AgentEvent {
     },
     InputDelivered {
         text: String,
+        attachments: Vec<crate::Attachment>,
     },
     MessageStart {
         message: Message,
@@ -85,6 +102,7 @@ pub enum AgentEvent {
         args: String,
     },
     ToolExecutionEnd {
+        output: crate::ToolOutput,
         tool_call_id: String,
         tool_name: String,
         text: String,
@@ -210,7 +228,11 @@ pub fn run_turn_with_control(
         let abort = host.abort.clone();
         let task = execution.active();
         std::thread::spawn(move || {
-            while task.is_some() && execution.active() == task && !abort.load(Ordering::Relaxed) {
+            while task.is_some()
+                && execution.active() == task
+                && execution.task().is_some_and(|t| !t.status.terminal())
+                && !abort.load(Ordering::Relaxed)
+            {
                 if execution.check_deadline().is_err() {
                     abort.store(true, Ordering::Relaxed);
                     break;
@@ -260,10 +282,13 @@ pub fn run_turn_with_control(
             break;
         }
 
-        for text in control.take_steering() {
-            on_event(AgentEvent::InputDelivered { text: text.clone() });
-            request.query = text.clone();
-            request.messages.push(Message::user(text));
+        for message in control.take_steering() {
+            on_event(AgentEvent::InputDelivered {
+                text: message.text().into(),
+                attachments: message.attachments().to_vec(),
+            });
+            request.query = message.text().into();
+            request.messages.push(message);
             stamp_last(&mut request, false);
             cached_recall = None;
         }
@@ -340,7 +365,7 @@ pub fn run_turn_with_control(
                 .total()
                 .saturating_add(input as u64)
                 .saturating_add(host.provider.output_reserve() as u64);
-            if required >= execution.snapshot().budget.tokens {
+            if required >= execution.available_tokens() {
                 error = Some("下一次模型请求将超过任务 token 预算".into());
                 break;
             }
@@ -367,6 +392,17 @@ pub fn run_turn_with_control(
             }
         }
 
+        if let Some(execution) = host.tools.execution() {
+            if let Err(reason) = execution.reserve_request(
+                budget_usage
+                    .total()
+                    .saturating_add(input as u64)
+                    .saturating_add(host.provider.output_reserve() as u64),
+            ) {
+                error = Some(reason);
+                break;
+            }
+        }
         let mut draft = AssistantDraft::default();
         let mut started = false;
         let stream_result = host.provider.stream(&context, &host.abort, &mut |event| {
@@ -434,6 +470,7 @@ pub fn run_turn_with_control(
                 error = Some(reason);
                 host.abort.store(true, Ordering::Relaxed);
             }
+            execution.release_request();
         }
 
         if let Err(err) = stream_result {
@@ -518,21 +555,28 @@ pub fn run_turn_with_control(
             break;
         }
         if calls.is_empty() {
+            // Steering that arrived during the last provider call still gets a turn.
+            if !control.queues.lock().unwrap().0.is_empty() {
+                continue;
+            }
             if let Some(action) = recovery.evaluate(draft.stop, &draft.text) {
                 request.messages.push(Message::ContextSummary {
                     text: action.nudge_text,
                 });
                 continue;
             }
-            if let Some(text) = control.take_follow_up() {
+            if let Some(message) = control.take_follow_up() {
                 on_event(AgentEvent::TurnEnd {
                     message: last_assistant.clone(),
                     tool_results: std::mem::take(&mut tool_results),
                 });
                 retain_new(host, &mut request, &mut on_event);
-                on_event(AgentEvent::InputDelivered { text: text.clone() });
-                request.query = text.clone();
-                request.messages.push(Message::user(text));
+                on_event(AgentEvent::InputDelivered {
+                    text: message.text().into(),
+                    attachments: message.attachments().to_vec(),
+                });
+                request.query = message.text().into();
+                request.messages.push(message);
                 stamp_last(&mut request, false);
                 cached_recall = None;
                 recovery = crate::pi::turn_recovery::TurnRecoveryState::new(
@@ -592,18 +636,17 @@ pub fn run_turn_with_control(
             {
                 Err("forget 仅用于本轮用户明确要求遗忘的内容".into())
             } else {
-                host.tools
-                    .call_with_abort(&call.name, &arguments, &host.abort)
+                host.tools.call_output(&call.name, &arguments, &host.abort)
             };
-            let (text, is_error) = match result {
-                Ok(text) => (text, false),
-                Err(err) => (err, true),
-            };
+            let output = result.unwrap_or_else(crate::ToolOutput::error);
+            let text = output.text.clone();
+            let is_error = output.failure.is_some();
             if call.name == "forget" && !is_error {
                 cached_recall = None;
             }
-            let result = Message::tool_result(&call.id, &call.name, text.clone(), is_error);
+            let result = Message::with_output(&call.id, &call.name, output.clone());
             on_event(AgentEvent::ToolExecutionEnd {
+                output,
                 tool_call_id: call.id,
                 tool_name: call.name.clone(),
                 text,
@@ -839,7 +882,7 @@ fn maybe_compact(
             .total()
             .saturating_add(estimated_input)
             .saturating_add(host.provider.output_reserve() as u64)
-            >= execution.snapshot().budget.tokens
+            >= execution.available_tokens()
         {
             let error = "摘要请求将超过任务 token 预算".to_string();
             on_event(AgentEvent::AutoCompactionEnd {
@@ -849,6 +892,19 @@ fn maybe_compact(
         }
     }
     let mut summary_usage = Usage::default();
+    if let Some(execution) = host.tools.execution() {
+        if let Err(error) = execution.reserve_request(
+            budget_usage
+                .total()
+                .saturating_add(estimated_input)
+                .saturating_add(host.provider.output_reserve() as u64),
+        ) {
+            on_event(AgentEvent::AutoCompactionEnd {
+                error: Some(error.clone()),
+            });
+            return Err(error);
+        }
+    }
     let result = host.provider.stream(&context, &host.abort, &mut |event| {
         match event {
             StreamEvent::Text(text) => summary.push_str(&text),
@@ -879,7 +935,9 @@ fn maybe_compact(
         },
     });
     if let Some(execution) = host.tools.execution() {
-        if let Err(error) = execution.check_budget(*budget_usage) {
+        let budget_result = execution.check_budget(*budget_usage);
+        execution.release_request();
+        if let Err(error) = budget_result {
             on_event(AgentEvent::AutoCompactionEnd {
                 error: Some(error.clone()),
             });

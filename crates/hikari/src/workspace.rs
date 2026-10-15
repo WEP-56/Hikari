@@ -341,6 +341,7 @@ impl Preview {
         }
         self.talks.remove(index);
         self.conversation_drafts.remove(&Some(id));
+        self.attachment_drafts.remove(&Some(id));
         match self.active {
             Some(active) if active > index => self.active = Some(active - 1),
             _ => {}

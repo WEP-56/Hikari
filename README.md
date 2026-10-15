@@ -34,6 +34,10 @@ Connect your model provider in Settings. Supports OpenAI Chat Completions, Respo
 
 MCP tools are discovered on demand with `tool_search`. Web fetching and paged conversation lookup are built in; enable Tavily, Exa, or Serper search in Settings → 其它提供商. Long tool output can be read further with `artifact_read`.
 
+Paste, drop, or choose images in the composer; click thumbnails to view them. Configure an OpenAI-compatible image generation endpoint in Settings → 其它提供商 to enable `image_gen`. Attachments are stored separately from session JSON and cleaned up when their conversation is deleted.
+
+`delegate_task` runs isolated child agents with shared workspace, permissions, and execution budgets. `skill_manage` creates, installs, updates, deletes, and rolls back complete Skill resource packages; running tasks keep their discovered Skill version.
+
 Memory stays in a local database. Extraction and consolidation use your configured model. No embedding model or extra service required.
 
 <details>

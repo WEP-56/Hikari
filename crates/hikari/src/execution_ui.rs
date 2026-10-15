@@ -254,9 +254,9 @@ impl Preview {
         let tasks = talk.execution.snapshot().tasks;
         let count = tasks
             .iter()
-            .filter(|task| task.kind == "process" && !task.status.terminal())
+            .filter(|task| background_task(task) && !task.status.terminal())
             .count();
-        if !tasks.iter().any(|task| task.kind == "process") {
+        if !tasks.iter().any(background_task) {
             return div().into_any_element();
         }
         let execution = talk.execution.clone();
@@ -280,8 +280,8 @@ impl Preview {
                     .outline()
                     .small()
                     .icon(IconName::SquareTerminal)
-                    .label(format!("后台进程 · {count}"))
-                    .tooltip("查看本会话的后台进程")
+                    .label(format!("后台任务 · {count}"))
+                    .tooltip("查看本会话的子 Agent 与后台进程")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(talk) = this.talks.iter_mut().find(|talk| talk.id == talk_id) {
                             talk.view.process_open = true;
@@ -297,6 +297,7 @@ impl Preview {
                 |_, _, _| (),
                 |bounds, _, _, _| {
                     crate::chat::tests::record_bounds("process-menu-toggle".into(), bounds);
+                    tests::record_bounds("process-menu-toggle".into(), bounds);
                 },
             )
             .absolute()
@@ -304,6 +305,10 @@ impl Preview {
         );
         holder.child(popover).into_any_element()
     }
+}
+
+fn background_task(task: &hikari_agent::execution::ExecutionTask) -> bool {
+    matches!(task.kind.as_str(), "process" | "delegate")
 }
 
 fn process_menu_body(
@@ -322,9 +327,10 @@ fn process_menu_body(
         .tasks
         .into_iter()
         .rev()
-        .filter(|task| task.kind == "process")
+        .filter(background_task)
     {
         let terminal = task.status.terminal();
+        let delegate = task.kind == "delegate";
         let status = match task.status {
             TaskStatus::Queued => "排队中",
             TaskStatus::Running => "运行中",
@@ -357,7 +363,10 @@ fn process_menu_body(
                         }
                         .outline()
                         .small()
-                        .child(status),
+                        .child(format!(
+                            "{} · {status}",
+                            if delegate { "子 Agent" } else { "进程" }
+                        )),
                     )
                     .child(
                         div()
@@ -366,11 +375,21 @@ fn process_menu_body(
                             .child(task.task_id.clone()),
                     ),
             )
-            .child(
+            .child(div().text_sm().child(task.command.unwrap_or_else(|| {
+                if delegate {
+                    "委派任务".into()
+                } else {
+                    "后台命令".into()
+                }
+            })));
+        if let Some(group) = task.group {
+            row = row.child(
                 div()
-                    .text_sm()
-                    .child(task.command.unwrap_or_else(|| "后台命令".into())),
+                    .text_xs()
+                    .text_color(ink.muted)
+                    .child(format!("分组：{group}")),
             );
+        }
         if !terminal {
             let execution = execution.clone();
             let id = task.task_id.clone();
@@ -382,7 +401,11 @@ fn process_menu_body(
                         .outline()
                         .small()
                         .icon(gpui_kit::assets::IconName::SquareStop)
-                        .label("停止进程")
+                        .label(if delegate {
+                            "停止任务"
+                        } else {
+                            "停止进程"
+                        })
                         .on_click(move |_, _, cx| {
                             let execution = execution.clone();
                             let id = id.clone();
@@ -407,7 +430,7 @@ fn process_menu_body(
             div()
                 .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
-                .child("本会话的后台进程"),
+                .child("本会话的后台任务"),
         )
         .child(list);
     #[cfg(test)]
@@ -553,6 +576,7 @@ impl TrackButton for Button {
                 |_, _, _| (),
                 move |bounds, _, _, _| {
                     crate::chat::tests::record_bounds(id.to_string(), bounds);
+                    tests::record_bounds(id.to_string(), bounds);
                 },
             )
             .absolute()
@@ -570,5 +594,139 @@ impl Drop for Preview {
             }
             talk.execution.cancel_all();
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use gpui_kit::InputEvent;
+
+    thread_local! {
+        static BOUNDS: std::cell::RefCell<std::collections::BTreeMap<String, Bounds<Pixels>>> = Default::default();
+    }
+
+    pub(super) fn record_bounds(id: String, bounds: Bounds<Pixels>) {
+        BOUNDS.with(|map| map.borrow_mut().insert(id, bounds));
+    }
+
+    fn click(window: &mut Window, cx: &mut App, id: &str) {
+        BOUNDS.with(|map| map.borrow_mut().clear());
+        window.refresh();
+        let _ = window.draw(cx);
+        let position = BOUNDS
+            .with(|map| map.borrow().get(id).copied())
+            .unwrap_or_else(|| panic!("missing {id}"))
+            .center();
+        window.dispatch_event(
+            MouseMoveEvent {
+                position,
+                pressed_button: None,
+                modifiers: Default::default(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.refresh();
+        let _ = window.draw(cx);
+        window.dispatch_event(
+            MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.refresh();
+        let _ = window.draw(cx);
+        window.dispatch_event(
+            MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.refresh();
+        let _ = window.draw(cx);
+    }
+
+    /// Called from the existing GPUI suite after its main execution has finished.
+    pub(crate) fn background_delegate_interactions(
+        view: &Entity<Preview>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let execution = view.read(cx).talks[view.read(cx).active.unwrap()]
+            .execution
+            .clone();
+        execution
+            .begin(
+                view.read(cx).agent_directory(),
+                "delegate-ui-fixture".into(),
+            )
+            .unwrap();
+        let abort = Arc::new(AtomicBool::new(false));
+        let child = execution
+            .spawn_agent(
+                "验证后台子任务停止入口",
+                Some("界面验证".into()),
+                abort.clone(),
+                Arc::new(TurnControl::default()),
+            )
+            .unwrap();
+        let id = child.active().unwrap();
+        execution.finish(None, false, Usage::default());
+        assert!(
+            !view.read(cx).active_busy(),
+            "A background delegate must leave normal input available"
+        );
+        let draft = view.read(cx).draft.clone();
+        draft.update(cx, |state, cx| state.set_value("下一条消息", window, cx));
+        assert_eq!(draft.read(cx).value().as_ref(), "下一条消息");
+        let input_before = draft.read(cx).input_bounds();
+        view.update(cx, |app, cx| {
+            app.talks[app.active.unwrap()].view.process_open = false;
+            cx.notify();
+        });
+        click(window, cx, "process-menu-toggle");
+        assert!(
+            view.read(cx).talks[view.read(cx).active.unwrap()]
+                .view
+                .process_open
+        );
+        click(window, cx, &format!("stop-{id}"));
+        let started = std::time::Instant::now();
+        while !abort.load(Ordering::Relaxed) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "Delegate stop click must reach its cancellation controller"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!view.read(cx).active_busy());
+        assert_eq!(
+            draft.read(cx).input_bounds(),
+            input_before,
+            "The task popover does not reserve composer space"
+        );
+        child.finish(None, true, Usage::default());
+        BOUNDS.with(|map| map.borrow_mut().clear());
+        window.refresh();
+        let _ = window.draw(cx);
+        assert!(
+            !BOUNDS.with(|map| map.borrow().contains_key(&format!("stop-{id}"))),
+            "Completed delegates have no stop action"
+        );
+        draft.update(cx, |state, cx| state.set_value("", window, cx));
+        view.update(cx, |app, cx| {
+            app.talks[app.active.unwrap()].view.process_open = false;
+            cx.notify();
+        });
     }
 }

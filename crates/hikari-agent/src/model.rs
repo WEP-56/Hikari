@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum Message {
     User {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<crate::Attachment>,
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<MessageOrigin>,
@@ -21,6 +23,10 @@ pub enum Message {
         provider_metadata: Option<ProviderMetadata>,
     },
     ToolResult {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<crate::Attachment>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<crate::ToolOutput>,
         tool_call_id: String,
         name: String,
         text: String,
@@ -48,6 +54,7 @@ pub struct MessageOrigin {
 impl Message {
     pub fn user(text: impl Into<String>) -> Self {
         Self::User {
+            attachments: Vec::new(),
             text: text.into(),
             origin: None,
         }
@@ -70,6 +77,8 @@ impl Message {
         is_error: bool,
     ) -> Self {
         Self::ToolResult {
+            attachments: Vec::new(),
+            output: None,
             tool_call_id: id.into(),
             name: name.into(),
             text: text.into(),
@@ -78,6 +87,31 @@ impl Message {
         }
     }
 
+    pub fn attachments(&self) -> &[crate::Attachment] {
+        match self {
+            Self::User { attachments, .. } | Self::ToolResult { attachments, .. } => attachments,
+            _ => &[],
+        }
+    }
+    pub fn set_attachments(&mut self, value: Vec<crate::Attachment>) {
+        match self {
+            Self::User { attachments, .. } | Self::ToolResult { attachments, .. } => {
+                *attachments = value
+            }
+            _ => {}
+        }
+    }
+    pub fn with_output(id: &str, name: &str, output: crate::ToolOutput) -> Self {
+        Self::ToolResult {
+            tool_call_id: id.into(),
+            name: name.into(),
+            text: output.text.clone(),
+            is_error: output.failure.is_some(),
+            attachments: output.attachments.clone(),
+            output: Some(output),
+            origin: None,
+        }
+    }
     pub fn text(&self) -> &str {
         match self {
             Self::User { text, .. }

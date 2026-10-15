@@ -22,6 +22,7 @@ pub struct AppConfig {
     pub skill_roots: Vec<PathBuf>,
     pub disabled_skills: Vec<PathBuf>,
     pub web: crate::web::WebConfig,
+    pub image_gen: crate::image_gen::ImageGenConfig,
 }
 impl Default for AppConfig {
     fn default() -> Self {
@@ -43,6 +44,7 @@ impl Default for AppConfig {
             skill_roots: vec![PathBuf::from(".hikari/skills")],
             disabled_skills: Vec::new(),
             web: Default::default(),
+            image_gen: Default::default(),
         }
     }
 }
@@ -106,6 +108,7 @@ impl AppConfig {
         self.appearance.validate()?;
         self.memory.validate()?;
         self.web.validate().map_err(AgentError::new)?;
+        self.image_gen.validate().map_err(AgentError::new)?;
         for reference in [&self.memory.extraction, &self.memory.consolidation] {
             if !reference.provider_id.is_empty()
                 && !self.providers.iter().any(|p| {

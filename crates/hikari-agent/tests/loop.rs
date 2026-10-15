@@ -142,6 +142,13 @@ fn recall_is_reused_during_tool_rounds_and_refreshes_for_identical_followup() {
 #[test]
 fn steering_waits_for_tools_followup_waits_for_reply_and_sparse_tool_indexes_work() {
     let control = Arc::new(TurnControl::default());
+    let root = tempfile::tempdir().unwrap();
+    let image = hikari_agent::AttachmentStore::new(root.path().into())
+        .import("queued.png", "image/png", b"\x89PNG\r\n\x1a\nfixture")
+        .unwrap();
+    let mut queued = Message::user("queued image");
+    queued.set_attachments(vec![image.clone()]);
+    control.steer_message(queued);
     let provider = Arc::new(Script {
         turns: Mutex::new(0),
         seen: Mutex::new(Vec::new()),
@@ -167,8 +174,11 @@ fn steering_waits_for_tools_followup_waits_for_reply_and_sparse_tool_indexes_wor
     run_turn_with_control(&host, request, &control, |e| events.push(e));
     let seen = provider.seen.lock().unwrap();
     assert_eq!(seen.len(), 3);
-    assert!(matches!(seen[1].get(2),Some(Message::ToolResult {text,..}) if text=="tool evidence"));
-    assert_eq!(seen[1][3].text(), "change the current task");
+    assert_eq!(seen[0][1].attachments(), &[image.clone()]);
+    assert!(seen[1]
+        .iter()
+        .any(|m| matches!(m,Message::ToolResult {text,..} if text=="tool evidence")));
+    assert_eq!(seen[1].last().unwrap().text(), "change the current task");
     assert_eq!(seen[2].last().unwrap().text(), "next request");
     assert_eq!(
         events
@@ -182,7 +192,7 @@ fn steering_waits_for_tools_followup_waits_for_reply_and_sparse_tool_indexes_wor
             .iter()
             .filter(|e| matches!(e, AgentEvent::InputDelivered { .. }))
             .count(),
-        2
+        3
     );
     assert_eq!(control.pending(), 0);
 }
