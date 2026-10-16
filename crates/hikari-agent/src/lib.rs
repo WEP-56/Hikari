@@ -20,12 +20,13 @@ pub mod provider;
 pub mod tool;
 pub mod tool_search;
 pub mod transport;
+mod fs_lock;
 
 pub use agent::{
     companion_prompt, run_turn, run_turn_with_control, AgentEvent, TurnControl, TurnHost,
     TurnRequest, DEFAULT_CONTEXT_TOKENS,
 };
-pub use error::{AgentError, Result};
+pub use error::{AgentError, ProviderErrorKind, Result, TurnOutcome};
 pub use memory::{
     ConsolidateReceipt, ConsolidateState, Memory, MemoryJobEvent, NullMemory, RecallItem,
     RetainReceipt, RetainState,

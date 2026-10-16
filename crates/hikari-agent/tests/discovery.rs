@@ -687,7 +687,7 @@ fn oversized_compaction_request_is_not_sent() {
             end = error;
         }
     });
-    assert!(end.unwrap().contains("摘要请求超过"));
+    assert!(end.unwrap().user_text().contains("摘要请求超过"));
 }
 
 #[test]

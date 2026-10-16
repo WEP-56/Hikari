@@ -12,10 +12,15 @@ fn configuration_and_session_replace_previous_files_without_losing_transcript() 
     let temp = tempfile::tempdir().unwrap();
     let config_store = ConfigStore::new(temp.path());
     let mut config = AppConfig::default();
+    config.dark = false;
+    config.follow_system = true;
     config_store.save(&config).unwrap();
     config.persona_name = "Hikari".into();
     config_store.save(&config).unwrap();
-    assert_eq!(config_store.load().unwrap().persona_name, "Hikari");
+    let loaded_config = config_store.load().unwrap();
+    assert_eq!(loaded_config.persona_name, "Hikari");
+    assert!(!loaded_config.dark);
+    assert!(loaded_config.follow_system);
     let store = SessionStore::new(temp.path());
     let transcript = vec![
         Message::user("original"),

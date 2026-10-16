@@ -89,3 +89,27 @@ pub(crate) fn estimate_request(
         .unwrap_or(u32::MAX)
         .saturating_add(image_reserve(context.messages))
 }
+
+/// Use the last provider-reported prompt size as an anchor and estimate only
+/// messages appended after it. Before the first response, retain the full
+/// request estimate as the conservative fallback.
+pub fn count_context_tokens(context: &Context<'_>) -> u32 {
+    let Some((index, usage)) = context.messages.iter().enumerate().rev().find_map(|(index, message)| {
+        match message {
+            Message::Assistant { usage: Some(usage), .. } => Some((index, *usage)),
+            _ => None,
+        }
+    }) else {
+        let bytes = context.system_prompt.len()
+            + serde_json::to_vec(context.messages).map_or(0, |v| v.len())
+            + serde_json::to_vec(context.tools).map_or(0, |v| v.len());
+        return u32::try_from(bytes.div_ceil(3)).unwrap_or(u32::MAX)
+            .saturating_add(image_reserve(context.messages));
+    };
+    let tail = &context.messages[index + 1..];
+    let bytes = serde_json::to_vec(tail).map_or(0, |v| v.len())
+        + context.tools.len().saturating_mul(64);
+    usage.input.try_into().unwrap_or(u32::MAX)
+        .saturating_add(u32::try_from(bytes.div_ceil(3)).unwrap_or(u32::MAX))
+        .saturating_add(image_reserve(tail))
+}

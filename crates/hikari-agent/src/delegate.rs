@@ -118,14 +118,14 @@ impl DelegateTool {
                     }
                 });
                 if error.is_none() && !abort.load(Ordering::Relaxed) {
-                    if summary.trim().is_empty() { error = Some("子 Agent 未返回 summary".into()); }
+                    if summary.trim().is_empty() { error = Some(crate::TurnOutcome::Provider { kind: crate::ProviderErrorKind::Unknown, message: "子 Agent 未返回 summary".into() }); }
                     if let Some(schema) = &task.output_schema {
                         let validation = serde_json::from_str::<Value>(&summary).map_err(|e| format!("结果不是 JSON：{e}")).and_then(|value| validate(&value, schema));
-                        if let Err(reason) = validation { error = Some(format!("output_schema 校验失败：{reason}")); }
+                        if let Err(reason) = validation { error = Some(crate::TurnOutcome::Provider { kind: crate::ProviderErrorKind::Unknown, message: format!("output_schema 校验失败：{reason}") }); }
                     }
                 }
                 // run_turn has already accounted for cumulative usage, including compaction.
-                if let Some(reason) = error.as_deref() { execution.finish(Some(reason), abort.load(Ordering::Relaxed), execution.task().map_or(usage, |t| t.usage)); }
+                if let Some(reason) = error.as_ref() { let text = reason.user_text(); execution.finish(Some(&text), abort.load(Ordering::Relaxed), execution.task().map_or(usage, |t| t.usage)); }
                 let status = execution.task().map(|t| t.status);
                 execution.deliver_summary(json!({"task_id":id,"status":status,"group":task.group,"summary":registry.summary_output(summary),"error":error,"derived_material":true}).to_string());
             }));

@@ -48,6 +48,10 @@ pub struct ProviderConfig {
     pub headers: BTreeMap<String, String>,
     pub compatibility: CompatibilityConfig,
     pub timeout_seconds: u64,
+    /// Maximum total attempts before a request-opening failure is returned.
+    pub max_attempts: Option<u32>,
+    /// Maximum SSE silence before the stream is considered stalled.
+    pub idle_timeout_seconds: Option<u64>,
 }
 /// Gateways vary in their Chat Completions and Responses dialects.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +63,8 @@ pub struct CompatibilityConfig {
     pub responses_store: bool,
     pub reasoning: bool,
     pub tool_disclosure: ToolDisclosure,
+    /// Some Anthropic-compatible gateways only accept a string system prompt.
+    pub prompt_cache: bool,
 }
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -78,6 +84,7 @@ impl Default for CompatibilityConfig {
             responses_store: false,
             reasoning: true,
             tool_disclosure: ToolDisclosure::Compatible,
+            prompt_cache: true,
         }
     }
 }
@@ -94,6 +101,8 @@ impl Default for ProviderConfig {
             headers: BTreeMap::new(),
             compatibility: CompatibilityConfig::default(),
             timeout_seconds: 60,
+            max_attempts: Some(11),
+            idle_timeout_seconds: Some(90),
         }
     }
 }
@@ -116,6 +125,12 @@ impl ProviderConfig {
         }
         if !(1..=600).contains(&self.timeout_seconds) {
             return Err(AgentError::new("请求超时需要在 1–600 秒内"));
+        }
+        if self.max_attempts.is_some_and(|value| !(1..=100).contains(&value)) {
+            return Err(AgentError::new("请求重试次数需要在 1–100 次内"));
+        }
+        if self.idle_timeout_seconds.is_some_and(|value| !(2..=3600).contains(&value)) {
+            return Err(AgentError::new("流空闲超时需要在 2–3600 秒内"));
         }
         if !["max_tokens", "max_completion_tokens"]
             .contains(&self.compatibility.max_tokens_field.as_str())
@@ -279,13 +294,17 @@ pub struct ProtocolProvider {
 impl ProtocolProvider {
     pub fn new(config: ProviderConfig, key: impl Into<String>) -> Result<Self> {
         config.validate()?;
-        let timeout = config.timeout_seconds;
+        let timeout_seconds = config.timeout_seconds;
         Ok(Self {
             config,
             key: key.into(),
             http: ureq::AgentBuilder::new()
-                .timeout_connect(Duration::from_secs(15))
-                .timeout_read(Duration::from_secs(timeout))
+                .timeout_connect(Duration::from_secs(timeout_seconds))
+                // ureq applies the read timeout while waiting for response
+                // headers as well as while reading the SSE body. Keep this
+                // wide enough for provider queueing/first-token latency;
+                // body idle handling remains explicit below.
+                .timeout_read(Duration::from_secs(timeout_seconds))
                 .timeout_write(Duration::from_secs(30))
                 .build(),
         })
@@ -365,23 +384,29 @@ impl Provider for ProtocolProvider {
                 },
             );
         }
-        let mut attempts = 0;
+        let policy = crate::transport::RetryPolicy {
+            max_attempts: self.config.max_attempts.unwrap_or(11),
+            ..Default::default()
+        };
+        let mut attempt = 1u32;
         let response = loop {
             match request.clone().send_json(body.clone()) {
                 Ok(response) => break response,
-                Err(error)
-                    if attempts < 2
-                        && matches!(
-                            &error,
-                            ureq::Error::Status(429 | 500 | 502 | 503 | 504, _)
-                        ) =>
-                {
-                    attempts += 1;
-                    for _ in 0..(attempts * 10) {
+                Err(error) if attempt < policy.max_attempts && crate::transport::is_retryable(&error) => {
+                    let retry_after = match &error {
+                        ureq::Error::Status(_, response) => crate::transport::parse_retry_after(response),
+                        ureq::Error::Transport(_) => None,
+                    };
+                    let delay = crate::transport::retry_delay_ms(&policy, attempt, retry_after);
+                    attempt += 1;
+                    let mut remaining = delay;
+                    while remaining > 0 {
                         if abort.load(Ordering::Relaxed) {
                             return Ok(());
                         }
-                        std::thread::sleep(Duration::from_millis(50));
+                        let slice = remaining.min(100);
+                        std::thread::sleep(Duration::from_millis(slice));
+                        remaining -= slice;
                     }
                 }
                 Err(error) => {
@@ -392,7 +417,7 @@ impl Provider for ProtocolProvider {
             }
         };
         let mut decoder = Decoder::new(self.config.protocol);
-        crate::transport::read_json_stream(response, abort, |value| {
+        crate::transport::read_json_stream_with_idle(response, abort, Duration::from_secs(self.config.idle_timeout_seconds.unwrap_or(90)), |value| {
             let events = decoder.decode(value)?;
             for event in events {
                 on_event(event);
@@ -639,7 +664,22 @@ pub fn request_body(config: &ProviderConfig, context: &Context<'_>) -> Value {
                 }
             }
             messages.append(&mut pending);
-            let mut body = json!({"model":config.model,"system":context.system_prompt,"messages":messages,
+            // Keep cache breakpoints stable: one after the system prefix and one
+            // on the last user block, independent of the number of tool rounds.
+            let system = if config.compatibility.prompt_cache {
+                json!([{"type":"text","text":context.system_prompt,"cache_control":{"type":"ephemeral"}}])
+            } else {
+                json!(context.system_prompt)
+            };
+            if config.compatibility.prompt_cache {
+                for last_user in messages.iter_mut().rev().filter(|m| m["role"] == "user") {
+                    if let Some(block) = last_user["content"].as_array_mut().and_then(|blocks| blocks.iter_mut().rev().find(|b| b["type"] == "text")) {
+                        block["cache_control"] = json!({"type":"ephemeral"});
+                        break;
+                    }
+                }
+            }
+            let mut body = json!({"model":config.model,"system":system,"messages":messages,
                 "stream":true,"max_tokens":config.max_output_tokens});
             let tools = if native { initial } else { context.tools };
             if !tools.is_empty() {

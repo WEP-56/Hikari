@@ -144,9 +144,9 @@ while task.is_some() && execution.active() == task
 
 CometixCode 的取消是贯穿的：`AbortController` 有父子链（`query.rs:429-433` 的 `child_of(seed.abort_controller)`），tokio `select!` 在命令通道上收 `Abort`（`query.rs:1377-1380`），HTTP 请求拿到同一个 signal（`query.rs:1244-1246`），工具执行循环轮询，pull 消费者 drop 也会 `close()`（`query/event_channel.rs:105-124`）。而且它显式记下了「为什么 Rust 需要这一层 CC 没有的东西」——CC 里 `query()` 是单事件循环上的 async generator，AbortSignal 直接生效。
 
-**判断**：CometixCode 的方案在架构上更正确，但前提是 tokio 全异步栈。**不必因此重写 `Provider` trait**（`provider.rs:53-58` 现在是同步 `fn stream`）——同步栈下有一个几十行的等价改法：把流式读的超时从 `config.timeout_seconds`（默认 60 秒）降到 2 秒，并把 `read_json_stream` 的循环（`transport.rs:30-60`）改成"超时即检查 abort 再继续"，abort 的最坏延迟就从 60 秒降到 2 秒。具体方案见 [roadmap2.md 第 3 条](../roadmap2.md)。全异步重写（收益是可取消 + 工具并发，成本是整个 agent crate 的线程模型）可以推到以后。另外应补一条：`call_with_abort` 只在工具实现主动检查时才有效，而 `Tool::call` 的默认路径（`tool.rs:26`）压根不看 abort。
+**判断**：CometixCode 的方案在架构上更正确，但前提是 tokio 全异步栈。Hikari 保持同步 `Provider` trait（`provider.rs` 的 `fn stream`），因此把首字节/套接字 `read` 超时降到 2 秒并不能单独实现可取消：`ureq` 会在响应状态行尚未到达时直接返回传输错误，慢请求会被误判为失败。当前实现让 socket `read` 超时复用 `config.timeout_seconds`，再由 `read_json_stream_with_idle` 独立管理 SSE 总空闲时间；读循环在每次 socket 超时后保留半行、检查 abort 并继续读取。具体实现见 [roadmap2.md 第 3 条](../roadmap2.md)。
 
-顺带记一条实测数据：取消延迟的实际上界是 `config.timeout_seconds`（默认 60 秒），因为 abort 无法打断已阻塞的 socket read；另外 SSE 读取期间的空闲超过该超时会被报成「流读取中断」并结束本轮（`transport.rs:37`），部分网关的心跳间隔会踩到这个。
+这仍不能在阻塞的 socket read 期间立刻响应停止。若以后需要约 2 秒的停止延迟，可以把底层读循环放进带界限的线程/通道，由调用线程用短 `recv_timeout` 轮询 abort，再考虑异步重写。另有一条独立限制：`call_with_abort` 只有工具实现主动检查时才有效，而 `Tool::call` 的默认路径不会自动中断。
 
 ### 2.6 并发 —— CometixCode 更激进，是 trade-off 不是纯优势
 

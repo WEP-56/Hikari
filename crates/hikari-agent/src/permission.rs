@@ -90,7 +90,7 @@ pub fn assess(
 ) -> Result<(Decision, Option<PathBuf>), String> {
     if matches!(
         name,
-        "read_file" | "read" | "write" | "edit" | "ls" | "find" | "grep"
+        "read" | "write" | "edit" | "ls" | "find" | "grep"
     ) {
         let path = resolve_path(root, args["path"].as_str().ok_or("缺少 path")?)?;
         let decision = if mode == PermissionMode::Autonomous {

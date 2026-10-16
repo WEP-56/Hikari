@@ -21,6 +21,9 @@ pub enum Message {
         tool_calls: Vec<ToolCall>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider_metadata: Option<ProviderMetadata>,
+        /// Full prompt/output usage returned for this assistant response.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
     },
     ToolResult {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -67,6 +70,7 @@ impl Message {
             thinking: String::new(),
             tool_calls: Vec::new(),
             provider_metadata: None,
+            usage: None,
         }
     }
 

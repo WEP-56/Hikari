@@ -272,6 +272,7 @@ fn responses_fragmented_call_keeps_native_reasoning_and_replays_result() {
             thinking: String::new(),
             tool_calls: Vec::new(),
             provider_metadata: Some(metadata),
+            usage: None,
         },
         Message::tool_result("call_1", "read", "result", false),
     ];
@@ -333,6 +334,7 @@ fn anthropic_signed_thinking_and_multiple_tool_results_roundtrip() {
             thinking: "想一想".into(),
             tool_calls: Vec::new(),
             provider_metadata: Some(metadata),
+            usage: None,
         },
         Message::tool_result("a", "read", "done", false),
         Message::tool_result("b", "read", "failed", true),
@@ -435,6 +437,7 @@ fn protocol_metadata_survives_session_serialization() {
             protocol: "responses".into(),
             items: vec![json!({"type":"reasoning","encrypted_content":"opaque"})],
         }),
+        usage: None,
     };
     assert_eq!(
         message,

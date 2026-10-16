@@ -6,13 +6,14 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 use crate::provider::ToolDef;
+use crate::fs_lock::PathLocks;
 
 const OUTPUT_CAP: usize = 16_000;
 #[path = "file_tools.rs"]
@@ -45,6 +46,15 @@ pub trait Tool: Send + Sync {
         self.call_authorized(arguments, abort, target)
             .map(crate::ToolOutput::text)
     }
+    fn call_output_with_progress(
+        &self,
+        arguments: &str,
+        abort: &AtomicBool,
+        target: Option<&Path>,
+        _on_progress: &mut dyn FnMut(ToolProgress),
+    ) -> Result<crate::ToolOutput, String> {
+        self.call_output(arguments, abort, target)
+    }
     fn output_limit(&self) -> usize {
         OUTPUT_CAP
     }
@@ -60,6 +70,11 @@ pub trait Tool: Send + Sync {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolProgress {
+    Text(String),
+}
+
 pub struct ToolRegistry {
     tools: Vec<Arc<dyn Tool>>,
     defs: Vec<ToolDef>,
@@ -68,6 +83,7 @@ pub struct ToolRegistry {
     artifacts: Option<PathBuf>,
     root: Option<PathBuf>,
     execution: Option<Arc<crate::execution::Execution>>,
+    locks: Arc<PathLocks>,
 }
 
 impl ToolRegistry {
@@ -88,6 +104,7 @@ impl ToolRegistry {
             artifacts: None,
             root: None,
             execution: None,
+            locks: Arc::new(PathLocks::default()),
         }
     }
 
@@ -99,34 +116,41 @@ impl ToolRegistry {
     pub fn workspace(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         let root = root.canonicalize().unwrap_or(root);
+        let locks = Arc::new(PathLocks::default());
         let mut registry = Self::new(vec![
             Arc::new(ShellTool { root: root.clone() }),
-            Arc::new(ReadTool { root: root.clone() }),
             Arc::new(FileTool {
                 root: root.clone(),
                 kind: "read",
+                locks: locks.clone(),
             }),
             Arc::new(FileTool {
                 root: root.clone(),
                 kind: "write",
+                locks: locks.clone(),
             }),
             Arc::new(FileTool {
                 root: root.clone(),
                 kind: "edit",
+                locks: locks.clone(),
             }),
             Arc::new(FileTool {
                 root: root.clone(),
                 kind: "ls",
+                locks: locks.clone(),
             }),
             Arc::new(FileTool {
                 root: root.clone(),
                 kind: "find",
+                locks: locks.clone(),
             }),
             Arc::new(FileTool {
                 root: root.clone(),
                 kind: "grep",
+                locks: locks.clone(),
             }),
         ]);
+        registry.locks = locks;
         registry.root = Some(root);
         registry
     }
@@ -183,6 +207,7 @@ impl ToolRegistry {
             artifacts: self.artifacts.clone(),
             root: self.root.clone(),
             execution: None,
+            locks: self.locks.clone(),
         };
         fork.enable_execution(execution)?;
         Ok(fork)
@@ -382,6 +407,27 @@ impl ToolRegistry {
         arguments: &str,
         abort: &AtomicBool,
     ) -> std::result::Result<crate::ToolOutput, String> {
+        self.call_output_impl(name, arguments, abort, None)
+    }
+
+    fn call_output_impl(
+        &self,
+        name: &str,
+        arguments: &str,
+        abort: &AtomicBool,
+        mut on_progress: Option<&mut dyn FnMut(ToolProgress)>,
+    ) -> std::result::Result<crate::ToolOutput, String> {
+        // Keep an internal compatibility alias for old sessions and runtime
+        // callers without advertising a second read tool to the model.
+        let legacy_read_file = name == "read_file";
+        let name = if legacy_read_file { "read" } else { name };
+        let legacy_arguments = if legacy_read_file {
+            let mut value: Value = serde_json::from_str(arguments).map_err(|e| e.to_string())?;
+            value["__hikari_legacy_raw"] = Value::Bool(true);
+            serde_json::to_string(&value).map_err(|e| e.to_string())?
+        } else {
+            arguments.to_string()
+        };
         if abort.load(Ordering::Relaxed) {
             return Err("已取消工具调用".into());
         }
@@ -515,7 +561,12 @@ impl ToolRegistry {
                     .map(crate::ToolOutput::text);
             }
         }
-        tool.call_output(arguments, abort, target.as_deref())
+        let result = if let Some(progress) = on_progress.as_deref_mut() {
+            tool.call_output_with_progress(&legacy_arguments, abort, target.as_deref(), progress)
+        } else {
+            tool.call_output(&legacy_arguments, abort, target.as_deref())
+        };
+        result
             .map(|mut output| {
                 let cap = tool.output_limit();
                 let failure_chars = output.failure.as_ref().map_or(0, |failure| {
@@ -574,6 +625,16 @@ impl ToolRegistry {
             .map_err(|s| self.finish_output(s, OUTPUT_CAP))
     }
 
+    pub fn call_output_with_progress(
+        &self,
+        name: &str,
+        arguments: &str,
+        abort: &AtomicBool,
+        on_progress: &mut dyn FnMut(ToolProgress),
+    ) -> std::result::Result<crate::ToolOutput, String> {
+        self.call_output_impl(name, arguments, abort, Some(on_progress))
+    }
+
     pub fn call(&self, name: &str, arguments: &str) -> std::result::Result<String, String> {
         self.call_with_abort(name, arguments, &AtomicBool::new(false))
     }
@@ -615,47 +676,20 @@ impl Tool for ShellTool {
     ) -> std::result::Result<String, String> {
         run_command(&self.root, &required_string(arguments, "command")?, abort)
     }
-}
-
-struct ReadTool {
-    root: PathBuf,
-}
-
-impl Tool for ReadTool {
-    fn name(&self) -> &str {
-        "read_file"
-    }
-
-    fn description(&self) -> &str {
-        "读取工作区里的一个文本文件。path 相对工作区。不要用它读目录。"
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "相对工作区的路径" }
-            },
-            "required": ["path"],
-            "additionalProperties": false
-        })
-    }
-
-    fn call(&self, arguments: &str) -> std::result::Result<String, String> {
-        let path = required_string(arguments, "path")?;
-        read_workspace_file(&self.root, &path)
-    }
-    fn call_authorized(
+    fn call_output_with_progress(
         &self,
         arguments: &str,
         abort: &AtomicBool,
-        target: Option<&Path>,
-    ) -> std::result::Result<String, String> {
-        if abort.load(Ordering::Relaxed) {
-            return Err("已取消".into());
-        }
-        let path = authorized_path(&self.root, &required_string(arguments, "path")?, target)?;
-        read_text_file(&path)
+        _target: Option<&Path>,
+        on_progress: &mut dyn FnMut(ToolProgress),
+    ) -> Result<crate::ToolOutput, String> {
+        let output = run_command_with_progress(
+            &self.root,
+            &required_string(arguments, "command")?,
+            abort,
+            on_progress,
+        )?;
+        Ok(crate::ToolOutput::text(output))
     }
 }
 
@@ -676,6 +710,24 @@ fn run_command(
     command: &str,
     abort: &AtomicBool,
 ) -> std::result::Result<String, String> {
+    run_command_inner(root, command, abort, None)
+}
+
+fn run_command_with_progress(
+    root: &Path,
+    command: &str,
+    abort: &AtomicBool,
+    on_progress: &mut dyn FnMut(ToolProgress),
+) -> std::result::Result<String, String> {
+    run_command_inner(root, command, abort, Some(on_progress))
+}
+
+fn run_command_inner(
+    root: &Path,
+    command: &str,
+    abort: &AtomicBool,
+    mut on_progress: Option<&mut dyn FnMut(ToolProgress)>,
+) -> std::result::Result<String, String> {
     if command.len() > 8_000 {
         return Err("命令太长".into());
     }
@@ -694,10 +746,13 @@ fn run_command(
             return Err(format!("无法登记进程树，已停止：{e}"));
         }
     };
+    let (tx, rx) = mpsc::channel();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let out_handle = thread::spawn(move || read_capped(stdout, 8 * 1024 * 1024));
-    let err_handle = thread::spawn(move || read_capped(stderr, 8 * 1024 * 1024));
+    let out_tx = tx.clone();
+    let out_handle = thread::spawn(move || read_capped_send(stdout, 8 * 1024 * 1024, out_tx, false));
+    let err_handle = thread::spawn(move || read_capped_send(stderr, 8 * 1024 * 1024, tx, true));
+    let mut captured = String::new();
     let started = Instant::now();
     let status = loop {
         match child.try_wait() {
@@ -724,23 +779,28 @@ fn run_command(
                 }
                 .into());
             }
-            Ok(None) => thread::sleep(Duration::from_millis(40)),
+            Ok(None) => {
+                while let Ok(chunk) = rx.try_recv() {
+                    if let Some(progress) = on_progress.as_deref_mut() {
+                        progress(ToolProgress::Text(chunk.clone()));
+                    }
+                    captured.push_str(&chunk);
+                }
+                thread::sleep(Duration::from_millis(40));
+            }
             Err(err) => return Err(format!("命令中断了。{err}")),
         }
     };
     job.terminate();
-    let stdout = out_handle.join().unwrap_or_default();
-    let stderr = err_handle.join().unwrap_or_default();
-    let mut text = String::new();
-    if !stdout.is_empty() {
-        text.push_str(&stdout);
-    }
-    if !stderr.is_empty() {
-        if !text.is_empty() {
-            text.push('\n');
+    let _ = out_handle.join();
+    let _ = err_handle.join();
+    while let Ok(chunk) = rx.try_recv() {
+        if let Some(progress) = on_progress.as_deref_mut() {
+            progress(ToolProgress::Text(chunk.clone()));
         }
-        text.push_str(&stderr);
+        captured.push_str(&chunk);
     }
+    let mut text = captured;
     if text.is_empty() {
         text.push_str(if status.success() {
             "完成，没有输出。"
@@ -756,20 +816,26 @@ fn run_command(
     Ok(text)
 }
 
-fn read_capped(reader: Option<impl Read>, cap: usize) -> String {
+fn read_capped_send(
+    reader: Option<impl Read>,
+    cap: usize,
+    tx: mpsc::Sender<String>,
+    stderr: bool,
+) {
     let Some(mut reader) = reader else {
-        return String::new();
+        return;
     };
     let mut buf = [0u8; 4096];
-    let mut kept = Vec::new();
+    let mut kept = 0usize;
     let mut truncated = false;
     loop {
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if kept.len() < cap {
-                    let take = n.min(cap - kept.len());
-                    kept.extend_from_slice(&buf[..take]);
+                if kept < cap {
+                    let take = n.min(cap - kept);
+                    kept += take;
+                    let _ = tx.send(String::from_utf8_lossy(&buf[..take]).into_owned());
                     if take < n {
                         truncated = true;
                     }
@@ -779,17 +845,14 @@ fn read_capped(reader: Option<impl Read>, cap: usize) -> String {
             }
         }
     }
-    let mut text = String::from_utf8_lossy(&kept).into_owned();
     if truncated {
-        text.push_str("\n…截断了");
+        let _ = tx.send("\n…截断了".into());
     }
-    text
+    if stderr {
+        let _ = tx.send("\n".into());
+    }
 }
 
-fn read_workspace_file(root: &Path, user_path: &str) -> std::result::Result<String, String> {
-    let full = resolve_inside(root, user_path)?;
-    read_text_file(&full)
-}
 fn read_text_file(full: &Path) -> std::result::Result<String, String> {
     let meta = fs::metadata(&full).map_err(|err| format!("读不到。{err}"))?;
     if meta.is_dir() {

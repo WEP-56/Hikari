@@ -199,6 +199,7 @@ struct Preview {
     workspace_picker_generation: u64,
     sidebar: bool,
     sidebar_width: f32,
+    titlebar_drag_pending: bool,
     resizing: bool,
     resize_origin: f32,
     resize_start: f32,
@@ -218,6 +219,7 @@ struct Preview {
     section: Section,
     settings_open: std::collections::HashSet<String>,
     dark: bool,
+    follow_system: bool,
     new_memory: bool,
     memory_core: Option<Arc<MemoryCore>>,
     memory_models: Arc<MemoryModels>,
@@ -446,15 +448,22 @@ impl Preview {
         let talks = sessions.into_iter().map(talk_from_session).collect();
         let (runtime_tx, runtime_rx) = mpsc::channel();
         let mcp = Arc::new(McpManager::default());
-        Theme::change(
-            if config.dark {
-                ThemeMode::Dark
+        let follow_system = config.follow_system;
+        let dark = if follow_system {
+            ThemeMode::from(cx.window_appearance()).is_dark()
+        } else {
+            config.dark
+        };
+        cx.set_window_appearance(if follow_system {
+            None
+        } else {
+            Some(if dark {
+                WindowAppearance::Dark
             } else {
-                ThemeMode::Light
-            },
-            Some(window),
-            cx,
-        );
+                WindowAppearance::Light
+            })
+        });
+        Theme::change(if dark { ThemeMode::Dark } else { ThemeMode::Light }, Some(window), cx);
 
         let mut this = Self {
             talks,
@@ -467,6 +476,7 @@ impl Preview {
             workspace_picker_generation: 0,
             sidebar: true,
             sidebar_width: 292.,
+            titlebar_drag_pending: false,
             resizing: false,
             resize_origin: 0.,
             resize_start: 292.,
@@ -485,7 +495,8 @@ impl Preview {
             settings: false,
             section: Section::Provider,
             settings_open: Default::default(),
-            dark: config.dark,
+            dark,
+            follow_system,
             new_memory: true,
             memory_core,
             memory_models,
@@ -559,23 +570,77 @@ impl Preview {
         };
         this.apply_typography(cx);
         this.observe_settings(window, cx);
+        let view = cx.entity().downgrade();
+        this._subscriptions.push(window.observe_window_appearance(move |window, cx| {
+            let _ = view.update(cx, |this, cx| {
+                if this.follow_system {
+                    this.dark = ThemeMode::from(window.appearance()).is_dark();
+                    this.apply_theme(window, cx);
+                    cx.notify();
+                }
+            });
+        }));
         this
     }
 
     fn set_dark(&mut self, dark: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let was_dirty = self.settings_dirty;
         self.dark = dark;
-        Theme::change(
-            if dark {
-                ThemeMode::Dark
-            } else {
-                ThemeMode::Light
-            },
-            Some(window),
-            cx,
-        );
-        self.apply_typography(cx);
-        self.settings_dirty = true;
+        self.follow_system = false;
+        self.apply_theme(window, cx);
+        if self.persist_theme() {
+            self.settings_dirty = was_dirty;
+        } else {
+            self.settings_dirty = true;
+        }
         cx.notify();
+    }
+
+    fn set_follow_system(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let was_dirty = self.settings_dirty;
+        self.follow_system = true;
+        cx.set_window_appearance(None);
+        self.dark = ThemeMode::from(cx.window_appearance()).is_dark();
+        self.apply_theme(window, cx);
+        if self.persist_theme() {
+            self.settings_dirty = was_dirty;
+        } else {
+            self.settings_dirty = true;
+        }
+        cx.notify();
+    }
+
+    fn apply_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.follow_system {
+            cx.set_window_appearance(None);
+        } else {
+            cx.set_window_appearance(Some(if self.dark {
+                WindowAppearance::Dark
+            } else {
+                WindowAppearance::Light
+            }));
+        }
+        Theme::change(if self.dark { ThemeMode::Dark } else { ThemeMode::Light }, Some(window), cx);
+        self.apply_typography(cx);
+    }
+
+    fn persist_theme(&mut self) -> bool {
+        let mut next = self.saved_config.clone();
+        next.dark = self.dark;
+        next.follow_system = self.follow_system;
+        match self.config_store.save(&next) {
+            Ok(()) => {
+                self.saved_config.dark = next.dark;
+                self.saved_config.follow_system = next.follow_system;
+                self.config.dark = next.dark;
+                self.config.follow_system = next.follow_system;
+                true
+            }
+            Err(error) => {
+                self.management_notice = format!("主题未保存：{}", error.message);
+                false
+            }
+        }
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -877,7 +942,7 @@ impl Preview {
                 execution.finish(Some(&error), false, Usage::default());
                 emit(AgentEvent::AgentEnd {
                     messages: request.messages,
-                    error: Some(error),
+                    error: Some(hikari_agent::TurnOutcome::Provider { kind: hikari_agent::ProviderErrorKind::Unknown, message: error }),
                     usage: Usage::default(),
                     retained_until,
                     context_base,
@@ -895,7 +960,7 @@ impl Preview {
                     gen,
                     event: AgentEvent::AgentEnd {
                         messages: Vec::new(),
-                        error: Some("内部出错了。".into()),
+                        error: Some(hikari_agent::TurnOutcome::Panic),
                         usage: Usage::default(),
                         retained_until,
                         context_base,
@@ -1110,6 +1175,15 @@ impl Preview {
                     }
                 }
             }
+            AgentEvent::ToolProgress { tool_call_id, text } => {
+                if let Some(line) = self.talks[idx].lines.iter_mut().rev().find(
+                    |line| matches!(&line.body, LineBody::Tool { id, .. } if id == &tool_call_id),
+                ) {
+                    if let LineBody::Tool { detail, .. } = &mut line.body {
+                        *detail = text.into();
+                    }
+                }
+            }
             AgentEvent::MemoryRecall { .. }
             | AgentEvent::MemoryRetain { .. }
             | AgentEvent::MemoryConsolidation { .. } => {}
@@ -1118,7 +1192,7 @@ impl Preview {
             }
             AgentEvent::AutoCompactionEnd { error } => {
                 if let Some(error) = error {
-                    self.insert_before_live(idx, Line::note(error));
+                    self.insert_before_live(idx, Line::note(error.user_text()));
                 }
             }
             AgentEvent::TurnEnd { .. } => {}
@@ -1138,7 +1212,8 @@ impl Preview {
                 self.talks[idx].usage = usage;
                 self.talks[idx].retained_until = retained_until;
                 self.talks[idx].context_base = context_base;
-                self.finish_pending(idx, error.as_deref().unwrap_or(""));
+                let error_text = error.as_ref().map_or_else(String::new, hikari_agent::TurnOutcome::user_text);
+                self.finish_pending(idx, &error_text);
                 if self.talks[idx].turn.as_ref().is_some_and(|t| t.gen == gen)
                     || gen == self.turn_gen
                 {
@@ -1192,11 +1267,10 @@ impl Preview {
                             *running = false;
                             *failed = true;
                             if detail.is_empty() {
-                                *detail = error
-                                    .as_deref()
-                                    .unwrap_or("任务结束，未收到工具结果。")
-                                    .to_string()
-                                    .into();
+                                *detail = error.as_ref().map_or_else(
+                                    || "任务结束，未收到工具结果。".to_string(),
+                                    hikari_agent::TurnOutcome::user_text,
+                                ).into();
                             }
                         }
                     }
@@ -1606,7 +1680,7 @@ impl Preview {
                     .hover(|this| this.bg(hsla(27.1 / 360., 1., 0.8, 0.35)))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                             this.resizing = true;
                             this.resize_origin = event.position.x.as_f32();
                             this.resize_start = this.sidebar_width;
@@ -1876,7 +1950,31 @@ impl Preview {
                     .id("main-drag")
                     .flex_1()
                     .h_full()
-                    .window_control_area(WindowControlArea::Drag),
+                    .window_control_area(WindowControlArea::Drag)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, _| {
+                            this.titlebar_drag_pending = true;
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.titlebar_drag_pending = false;
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.titlebar_drag_pending = false;
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, _, window, _| {
+                        if this.titlebar_drag_pending {
+                            this.titlebar_drag_pending = false;
+                            window.start_window_move();
+                        }
+                    })),
             )
             .child(
                 Button::new("term")
@@ -1942,7 +2040,11 @@ impl Preview {
                         .font_family(self.config.appearance.text_font.clone())
                         .text_size(px(self.config.appearance.text_size))
                         .line_height(relative(self.config.appearance.line_height))
-                        .children(self.conversation(idx, ink, cx)),
+                        .children(self.conversation(
+                            idx,
+                            ink,
+                            cx,
+                        )),
                 )
                 .into_any_element()
         } else {
@@ -2974,17 +3076,26 @@ impl Preview {
         let themes = h_flex()
             .gap_2()
             .child(
+                Button::new("system")
+                    .label("跟随设备")
+                    .when(self.follow_system, |b| b.primary())
+                    .when(!self.follow_system, |b| b.ghost())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.set_follow_system(window, cx)
+                    })),
+            )
+            .child(
                 Button::new("light")
                     .label("浅色")
-                    .when(!self.dark, |b| b.primary())
-                    .when(self.dark, |b| b.ghost())
+                    .when(!self.follow_system && !self.dark, |b| b.primary())
+                    .when(self.follow_system || self.dark, |b| b.ghost())
                     .on_click(cx.listener(|this, _, window, cx| this.set_dark(false, window, cx))),
             )
             .child(
                 Button::new("dark")
                     .label("深色")
-                    .when(self.dark, |b| b.primary())
-                    .when(!self.dark, |b| b.ghost())
+                    .when(!self.follow_system && self.dark, |b| b.primary())
+                    .when(self.follow_system || !self.dark, |b| b.ghost())
                     .on_click(cx.listener(|this, _, window, cx| this.set_dark(true, window, cx))),
             );
         v_flex()

@@ -17,6 +17,7 @@ pub struct AppConfig {
     pub persona_name: String,
     pub memory: crate::MemoryConfig,
     pub dark: bool,
+    pub follow_system: bool,
     pub max_tool_rounds: usize,
     pub mcp_servers: Vec<McpServerConfig>,
     pub skill_roots: Vec<PathBuf>,
@@ -39,7 +40,9 @@ impl Default for AppConfig {
             persona_name: "光".into(),
             memory: crate::MemoryConfig::default(),
             dark: true,
-            max_tool_rounds: 50,
+            follow_system: false,
+            // Zero means no local tool-round cap; token/time budgets remain active.
+            max_tool_rounds: 0,
             mcp_servers: Vec::new(),
             skill_roots: vec![PathBuf::from(".hikari/skills")],
             disabled_skills: Vec::new(),
@@ -119,8 +122,8 @@ impl AppConfig {
                 return Err(AgentError::new("记忆引用的提供商或模型不存在"));
             }
         }
-        if !(1..=1000).contains(&self.max_tool_rounds) {
-            return Err(AgentError::new("最大工具轮数需要在 1–1000 内"));
+        if self.max_tool_rounds > 1000 {
+            return Err(AgentError::new("最大工具轮数需要为 0（不限）或 1–1000"));
         }
         let mut ids = std::collections::HashSet::new();
         for profile in &self.providers {

@@ -17,17 +17,6 @@ pub const MAX_TOOL_ITERATIONS_CEILING: usize = 1_000;
 /// recommended retry budget explicit and small.
 pub const MAX_PAUSE_TURN_CONTINUATIONS: usize = 3;
 
-/// Threshold (as a fraction of `max_tool_iterations`) at which the runtime
-/// emits a one-shot soft-handoff steering message so the agent can begin a
-/// graceful incomplete-handoff rather than being silently killed at the cap.
-/// Encoded as numerator/denominator to avoid floating-point in a hot loop.
-const ITERATION_WARN_NUMERATOR: usize = 4;
-const ITERATION_WARN_DENOMINATOR: usize = 5;
-
-/// Below this absolute cap, the soft-handoff warning is suppressed — for
-/// caps like 3 or 4, the warning would fire on the first iteration and add
-/// noise rather than help.
-const ITERATION_WARN_MIN_CAP: usize = 5;
 
 /// Resolve the effective tool-iteration cap from `PI_MAX_TOOL_ITERATIONS`.
 ///
@@ -96,33 +85,4 @@ pub fn clamp_max_tool_iterations(value: Option<usize>) -> usize {
         }
         Some(n) => n,
     }
-}
-
-/// Pure predicate: should we emit the one-shot iteration-budget warning at
-/// the current iteration, given the configured cap?
-///
-/// Fires when `current >= (max * 4) / 5` and `max >= ITERATION_WARN_MIN_CAP`.
-/// Caller is responsible for tracking fire-once state so the steering message
-/// only injects once per run-loop. Stateless and integer-only so it's safe to
-/// call inside the hot loop. Uses `saturating_mul` so an SDK caller that
-/// writes `AgentConfig::max_tool_iterations = usize::MAX` directly (bypassing
-/// the resolvers' clamp) gets a sane "never warn" rather than wrap-around to
-/// a tiny threshold.
-pub const fn should_warn_at_iteration_threshold(current: usize, max: usize) -> bool {
-    max >= ITERATION_WARN_MIN_CAP
-        && current >= max.saturating_mul(ITERATION_WARN_NUMERATOR) / ITERATION_WARN_DENOMINATOR
-}
-
-/// Body of the one-shot soft-handoff steering message, formatted with the
-/// current/max iteration counts. Kept as a free function so test fixtures
-/// can pin the wording without instantiating a full agent.
-pub fn iteration_handoff_steering_text(current: usize, max: usize) -> String {
-    format!(
-        "[runtime] Tool-iteration budget at >=80% (used {current} of {max}). \
-         Per the iteration-aware-handoff protocol in your spec, begin graceful \
-         handoff now: commit current work, post a one-line status note, and \
-         write an incomplete-handoff envelope with what's done / what remains \
-         / next-agent starting position. Do NOT compress remaining work into \
-         the last few iterations."
-    )
 }

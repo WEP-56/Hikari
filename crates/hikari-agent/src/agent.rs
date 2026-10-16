@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use crate::memory::{ConsolidateState, Memory, RecallItem, RetainState};
 use crate::model::{Message, ToolCall, Usage};
 use crate::provider::{Context, Provider, StreamEvent};
+use crate::TurnOutcome;
 
 pub const DEFAULT_CONTEXT_TOKENS: u32 = 128_000;
 const COMPACT_KEEP: usize = 8;
@@ -108,13 +109,17 @@ pub enum AgentEvent {
         text: String,
         is_error: bool,
     },
+    ToolProgress {
+        tool_call_id: String,
+        text: String,
+    },
     TurnEnd {
         message: Message,
         tool_results: Vec<Message>,
     },
     AgentEnd {
         messages: Vec<Message>,
-        error: Option<String>,
+        error: Option<TurnOutcome>,
         usage: Usage,
         retained_until: usize,
         context_base: usize,
@@ -123,7 +128,7 @@ pub enum AgentEvent {
         reason: String,
     },
     AutoCompactionEnd {
-        error: Option<String>,
+        error: Option<TurnOutcome>,
     },
     MemoryRecall {
         query: String,
@@ -209,8 +214,11 @@ pub fn run_turn_with_control(
             .messages
             .push(Message::ToolCatalog { tools: current });
     }
-    request.max_tool_rounds =
-        crate::pi::iterations::clamp_max_tool_iterations(Some(request.max_tool_rounds));
+    if request.max_tool_rounds == 0 {
+        request.max_tool_rounds = usize::MAX;
+    } else {
+        request.max_tool_rounds = crate::pi::iterations::clamp_max_tool_iterations(Some(request.max_tool_rounds));
+    }
     if request.retained_until > request.messages.len() {
         request.retained_until = request.messages.len();
     }
@@ -243,20 +251,20 @@ pub fn run_turn_with_control(
     }
     let mut tool_results = Vec::new();
     let mut last_assistant = Message::assistant("");
-    let mut error = None;
+    let mut outcome = TurnOutcome::Completed;
     let mut rounds = 0usize;
     let mut recovery = crate::pi::turn_recovery::TurnRecoveryState::new(
         crate::pi::turn_recovery::TurnRecoveryMode::Conservative,
     );
     let mut pause_continuations = 0;
-    let mut handoff_warned = false;
+    let mut reactive_compaction_attempted = false;
     let mut cached_recall: Option<(String, Vec<RecallItem>)> = None;
 
     loop {
         if let Some(execution) = host.tools.execution() {
             if let Err(reason) = execution.check_budget(budget_usage) {
                 host.abort.store(true, Ordering::Relaxed);
-                error = Some(reason);
+                outcome = TurnOutcome::TokenBudgetExhausted { reason };
                 break;
             }
             // Background completion enters only at a serialized context boundary.
@@ -275,7 +283,7 @@ pub fn run_turn_with_control(
             }
         }
         if host.abort.load(Ordering::Relaxed) {
-            error = Some("已停下。".to_string());
+            outcome = TurnOutcome::Stopped;
             if !request.messages.iter().any(is_assistant) {
                 push_assistant(&mut request, &mut last_assistant, "已停下。", &mut on_event);
             }
@@ -359,12 +367,12 @@ pub fn run_turn_with_control(
             tools: &defs,
         };
 
-        let input = host.provider.input_tokens(&context);
+        let input = crate::provider::count_context_tokens(&context);
         if let Some(execution) = host.tools.execution() {
             // Stop on tokens already spent. Do not refuse the next call just because
             // resending the context plus the maximum output reserve might cross the cap.
             if budget_usage.total() >= execution.available_tokens() {
-                error = Some("任务 token 预算已用完".into());
+                outcome = TurnOutcome::TokenBudgetExhausted { reason: "请求前预算检查失败".into() };
                 break;
             }
         }
@@ -376,23 +384,21 @@ pub fn run_turn_with_control(
             if let Err(message) =
                 maybe_compact(host, &mut request, &mut budget_usage, &mut on_event)
             {
-                error = Some(message);
+                outcome = TurnOutcome::CompactionFailed { reason: message };
                 break;
             }
             if request.messages != before {
                 continue;
             }
             if input >= available {
-                error = Some(
-                    "完整请求超过上下文预算，请缩短输入、角色卡或工具定义，或提高上下文限制".into(),
-                );
+                outcome = TurnOutcome::ContextOverBudget;
                 break;
             }
         }
 
         if let Some(execution) = host.tools.execution() {
             if let Err(reason) = execution.reserve_request(budget_usage.total()) {
-                error = Some(reason);
+                outcome = TurnOutcome::TokenBudgetExhausted { reason };
                 break;
             }
         }
@@ -441,7 +447,7 @@ pub fn run_turn_with_control(
                     },
                 });
                 if let Err(reason) = execution.check_budget(consumed) {
-                    error = Some(reason);
+                    outcome = TurnOutcome::TokenBudgetExhausted { reason };
                     host.abort.store(true, Ordering::Relaxed);
                 }
             }
@@ -460,13 +466,25 @@ pub fn run_turn_with_control(
         });
         if let Some(execution) = host.tools.execution() {
             if let Err(reason) = execution.check_budget(budget_usage) {
-                error = Some(reason);
+                outcome = TurnOutcome::TokenBudgetExhausted { reason };
                 host.abort.store(true, Ordering::Relaxed);
             }
             execution.release_request();
         }
 
         if let Err(err) = stream_result {
+            let lower = err.message.to_ascii_lowercase();
+            if !reactive_compaction_attempted
+                && (lower.contains("context") || lower.contains("prompt") || lower.contains("too long") || lower.contains("tokens"))
+            {
+                reactive_compaction_attempted = true;
+                let before = request.messages.clone();
+                if maybe_compact(host, &mut request, &mut budget_usage, &mut on_event).is_ok()
+                    && request.messages != before
+                {
+                    continue;
+                }
+            }
             let notice = format!("没有连上。{err}");
             if draft.text.is_empty() {
                 draft.text = notice.clone();
@@ -474,16 +492,16 @@ pub fn run_turn_with_control(
                 draft.text.push_str("\n\n");
                 draft.text.push_str(&notice);
             }
-            if error.is_none() {
-                error = Some(err.message);
+            if matches!(outcome, TurnOutcome::Completed) {
+                outcome = provider_outcome(err.message);
             }
         } else if host.abort.load(Ordering::Relaxed)
             && draft.text.is_empty()
             && draft.calls.is_empty()
         {
             draft.text = "已停下。".to_string();
-            if error.is_none() {
-                error = Some("已停下。".to_string());
+            if matches!(outcome, TurnOutcome::Completed) {
+                outcome = TurnOutcome::Stopped;
             }
         }
 
@@ -518,12 +536,15 @@ pub fn run_turn_with_control(
             Message::Assistant { tool_calls, .. } => tool_calls.clone(),
             _ => Vec::new(),
         };
-        if error.is_some()
+        if !matches!(outcome, TurnOutcome::Completed)
             || host.abort.load(Ordering::Relaxed)
             || draft.stop == crate::model::StopReason::Error
         {
-            if draft.stop == crate::model::StopReason::Error && error.is_none() {
-                error = Some("模型未能完成本轮请求".into());
+            if draft.stop == crate::model::StopReason::Error && matches!(outcome, TurnOutcome::Completed) {
+                outcome = TurnOutcome::Provider {
+                    kind: crate::ProviderErrorKind::Unknown,
+                    message: "模型未能完成本轮请求".into(),
+                };
             }
             for call in &calls {
                 request.messages.push(Message::tool_result(
@@ -534,7 +555,7 @@ pub fn run_turn_with_control(
                 ));
             }
             if host.abort.load(Ordering::Relaxed) {
-                error = Some("已停下。".to_string());
+                outcome = TurnOutcome::Stopped;
             }
             break;
         }
@@ -544,7 +565,7 @@ pub fn run_turn_with_control(
                 pause_continuations += 1;
                 continue;
             }
-            error = Some("模型暂停的续接次数已达上限".into());
+            outcome = TurnOutcome::PauseTurnLimit { used: pause_continuations };
             break;
         }
         if calls.is_empty() {
@@ -576,12 +597,12 @@ pub fn run_turn_with_control(
                     crate::pi::turn_recovery::TurnRecoveryMode::Conservative,
                 );
                 rounds = 0;
-                handoff_warned = false;
                 continue;
             }
             break;
         }
-        if rounds >= request.max_tool_rounds {
+        if request.max_tool_rounds != usize::MAX && rounds >= request.max_tool_rounds {
+            outcome = TurnOutcome::ToolRoundLimit { used: rounds, cap: request.max_tool_rounds };
             for call in &calls {
                 request.messages.push(Message::tool_result(
                     &call.id,
@@ -601,7 +622,7 @@ pub fn run_turn_with_control(
         rounds += 1;
         for call in calls {
             if host.abort.load(Ordering::Relaxed) {
-                error = Some("已停下。".to_string());
+                outcome = TurnOutcome::Stopped;
                 request.messages.push(Message::tool_result(
                     &call.id,
                     &call.name,
@@ -629,12 +650,22 @@ pub fn run_turn_with_control(
             {
                 Err("forget 仅用于本轮用户明确要求遗忘的内容".into())
             } else {
-                host.tools.call_output(&call.name, &arguments, &host.abort)
+                host.tools.call_output_with_progress(
+                    &call.name,
+                    &arguments,
+                    &host.abort,
+                    &mut |progress| match progress {
+                        crate::tool::ToolProgress::Text(text) => on_event(AgentEvent::ToolProgress {
+                            tool_call_id: call.id.clone(),
+                            text,
+                        }),
+                    },
+                )
             };
             let output = result.unwrap_or_else(crate::ToolOutput::error);
             let text = output.text.clone();
             let is_error = output.failure.is_some();
-            if call.name == "forget" && !is_error {
+            if invalidates_turn_cache(&call.name, &arguments) && !is_error {
                 cached_recall = None;
             }
             let result = Message::with_output(&call.id, &call.name, output.clone());
@@ -667,20 +698,6 @@ pub fn run_turn_with_control(
             }
             checkpoint(&request, &mut on_event);
         }
-        if !handoff_warned
-            && crate::pi::iterations::should_warn_at_iteration_threshold(
-                rounds,
-                request.max_tool_rounds,
-            )
-        {
-            handoff_warned = true;
-            request.messages.push(Message::ContextSummary {
-                text: crate::pi::iterations::iteration_handoff_steering_text(
-                    rounds,
-                    request.max_tool_rounds,
-                ),
-            });
-        }
     }
 
     on_event(AgentEvent::TurnEnd {
@@ -695,19 +712,56 @@ pub fn run_turn_with_control(
     }
     retain_new(host, &mut request, &mut on_event);
     if let Some(execution) = host.tools.execution() {
+        let outcome_text = if matches!(outcome, TurnOutcome::Completed) {
+            None
+        } else {
+            Some(outcome.user_text())
+        };
         execution.finish(
-            error.as_deref(),
+            outcome_text.as_deref(),
             host.abort.load(Ordering::Relaxed),
             budget_usage,
         );
     }
     on_event(AgentEvent::AgentEnd {
         messages: request.messages,
-        error,
+        error: (!matches!(outcome, TurnOutcome::Completed)).then_some(outcome),
         usage,
         retained_until: request.retained_until,
         context_base: request.context_base,
     });
+}
+
+fn invalidates_turn_cache(name: &str, arguments: &str) -> bool {
+    if matches!(name, "forget" | "skill_manage") {
+        return true;
+    }
+    if !matches!(name, "write" | "edit") {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else { return false; };
+    let path = value.get("path").and_then(serde_json::Value::as_str).unwrap_or_default().to_ascii_lowercase();
+    path.ends_with("agents.md") || path.contains(".hikari/skills") || path.contains(".hikari\\skills")
+}
+
+fn provider_outcome(message: String) -> TurnOutcome {
+    let lower = message.to_ascii_lowercase();
+    let kind = if lower.contains("空闲超时") || lower.contains("idle timeout") {
+        crate::ProviderErrorKind::IdleTimeout
+    } else if lower.contains("流读取中断") || lower.contains("stream") {
+        crate::ProviderErrorKind::StreamBroken
+    } else if lower.contains("429") || lower.contains("rate limit") {
+        crate::ProviderErrorKind::RateLimited
+    } else if lower.contains("context") || lower.contains("prompt") || lower.contains("too long") {
+        crate::ProviderErrorKind::ContextOverflow
+    } else if lower.contains("401") || lower.contains("403") || lower.contains("密钥") {
+        crate::ProviderErrorKind::Auth
+    } else if lower.contains("连接失败") || lower.contains("timeout") {
+        crate::ProviderErrorKind::Retryable
+    } else {
+        crate::ProviderErrorKind::Unknown
+    };
+    TurnOutcome::Provider { kind, message }
 }
 
 fn checkpoint(request: &TurnRequest, on_event: &mut impl FnMut(AgentEvent)) {
@@ -864,7 +918,7 @@ fn maybe_compact(
         let error =
             "摘要请求超过上下文预算，原文已保留；请缩短输入或使用更大上下文的模型".to_string();
         on_event(AgentEvent::AutoCompactionEnd {
-            error: Some(error.clone()),
+            error: Some(TurnOutcome::ContextOverBudget),
         });
         return Err(error);
     }
@@ -874,7 +928,7 @@ fn maybe_compact(
         if budget_usage.total() >= execution.available_tokens() {
             let error = "任务 token 预算已用完".to_string();
             on_event(AgentEvent::AutoCompactionEnd {
-                error: Some(error.clone()),
+                error: Some(TurnOutcome::TokenBudgetExhausted { reason: error.clone() }),
             });
             return Err(error);
         }
@@ -883,7 +937,7 @@ fn maybe_compact(
     if let Some(execution) = host.tools.execution() {
         if let Err(error) = execution.reserve_request(budget_usage.total()) {
             on_event(AgentEvent::AutoCompactionEnd {
-                error: Some(error.clone()),
+                error: Some(TurnOutcome::Provider { kind: crate::ProviderErrorKind::Unknown, message: error.clone() }),
             });
             return Err(error);
         }
@@ -922,21 +976,21 @@ fn maybe_compact(
         execution.release_request();
         if let Err(error) = budget_result {
             on_event(AgentEvent::AutoCompactionEnd {
-                error: Some(error.clone()),
+                error: Some(TurnOutcome::TokenBudgetExhausted { reason: error.clone() }),
             });
             return Err(error);
         }
     }
     if let Err(err) = result {
         on_event(AgentEvent::AutoCompactionEnd {
-            error: Some(err.message.clone()),
+            error: Some(TurnOutcome::Provider { kind: crate::ProviderErrorKind::Unknown, message: err.message.clone() }),
         });
         return Err(err.message);
     }
     if summary.trim().is_empty() || host.abort.load(Ordering::Relaxed) {
         let error = "上下文摘要未完成，原文已保留".to_string();
         on_event(AgentEvent::AutoCompactionEnd {
-            error: Some(error.clone()),
+            error: Some(TurnOutcome::CompactionFailed { reason: error.clone() }),
         });
         return Err(error);
     }
@@ -947,6 +1001,13 @@ fn maybe_compact(
         .find(|m| matches!(m, Message::ToolCatalog { .. }))
         .cloned();
     request.messages.drain(..cut);
+    // Usage belongs to the pre-compaction prompt. It cannot anchor the new,
+    // shorter transcript, so force the next request to establish a fresh one.
+    for message in &mut request.messages {
+        if let Message::Assistant { usage, .. } = message {
+            *usage = None;
+        }
+    }
     request
         .messages
         .insert(0, Message::ContextSummary { text: summary });
@@ -1138,6 +1199,7 @@ impl AssistantDraft {
             thinking: self.thinking.clone(),
             tool_calls,
             provider_metadata: self.metadata.clone(),
+            usage: (self.usage.input > 0 || self.usage.output > 0).then_some(self.usage),
         }
     }
 }
@@ -1532,7 +1594,7 @@ mod tests {
         else {
             panic!("missing end");
         };
-        assert!(error.as_deref().unwrap().contains("401"));
+        assert!(error.as_ref().unwrap().user_text().contains("401"));
         assert!(messages.last().unwrap().text().contains("没有连上"));
     }
 }

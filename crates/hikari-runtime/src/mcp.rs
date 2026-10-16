@@ -663,6 +663,7 @@ impl Client {
         self.next_id += 1;
         let id = self.next_id;
         let body = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
+        let timeout = self.timeout;
         let response = match &mut self.transport {
             Transport::Stdio { input, output, .. } => {
                 Self::send_stdio(input, &body)?;
@@ -721,7 +722,7 @@ impl Client {
                     *session = response.header("Mcp-Session-Id").map(str::to_string);
                 }
                 let mut result = None;
-                hikari_agent::transport::read_json_stream(response, abort, |frame| {
+                hikari_agent::transport::read_json_stream_with_idle(response, abort, timeout, |frame| {
                     if frame["id"] == id {
                         result = Some(frame);
                         Ok(true)

@@ -11,6 +11,7 @@ fn assistant(text: &str, thinking: &str, calls: Vec<ToolCall>) -> Message {
         thinking: thinking.into(),
         tool_calls: calls,
         provider_metadata: None,
+        usage: None,
     }
 }
 

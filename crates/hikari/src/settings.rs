@@ -477,7 +477,16 @@ impl Preview {
                 .update(cx, |state, cx| state.set_value(card, window, cx));
         }
         self.reload_editors(window, cx);
-        self.set_dark(self.config.dark, window, cx);
+        self.follow_system = self.config.follow_system;
+        if self.follow_system {
+            cx.set_window_appearance(None);
+        }
+        self.dark = if self.follow_system {
+            ThemeMode::from(cx.window_appearance()).is_dark()
+        } else {
+            self.config.dark
+        };
+        self.apply_theme(window, cx);
         self.settings_dirty = false;
         self.management_notice = "已恢复保存的设置".into();
     }
@@ -981,6 +990,7 @@ impl Preview {
         config.memory.auto_tokens = number(&self.memory_tokens, "自动召回 tokens", cx)?;
         config.memory.auto_items = number(&self.memory_items, "自动召回条数", cx)?;
         config.dark = self.dark;
+        config.follow_system = self.follow_system;
         config.appearance = self.read_appearance(cx)?;
         for provider in SearchProvider::ALL {
             let draft = &self.settings_draft.web_profiles[provider.index()];
@@ -1430,7 +1440,7 @@ impl Preview {
                     ),
             )
             .child(field(
-                "工具轮数",
+                "工具轮数（0=不限）",
                 Input::new(&self.settings_draft.rounds),
                 theme,
             ))
@@ -1781,7 +1791,7 @@ impl Preview {
             .when(open, |this| {
                 let compat = profile.config.compatibility.clone();
                 this.child(field(
-                    "超时（秒）",
+                    "连接超时（秒）",
                     Input::new(&self.settings_draft.timeout),
                     theme.clone(),
                 ))

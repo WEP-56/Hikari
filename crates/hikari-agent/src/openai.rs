@@ -138,7 +138,7 @@ fn wire_messages(system: &str, messages: &[Message]) -> Vec<Value> {
         match message {
             Message::ToolCatalog { .. } => {}
             Message::User { text, attachments, .. } => out.push(json!({"role": "user", "content": if attachments.is_empty(){json!(text)}else{crate::attachment::content_parts(text, attachments, "chat")} })),
-            Message::ContextSummary { text } => out.push(json!({"role":"system","content":text})),
+            Message::ContextSummary { text } => out.push(json!({"role":"user","content":format!("<context-summary>{text}</context-summary>")})),
             Message::Assistant {
                 text, tool_calls, ..
             } => {
