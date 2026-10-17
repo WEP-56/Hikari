@@ -2,6 +2,7 @@
 // 从终端（cargo run / cmd / PowerShell）启动时标准输出仍由该终端接收。
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+use gpui_kit::base::GlobalState as BaseGlobalState;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
@@ -243,6 +244,7 @@ struct Preview {
     terminal_error: Option<String>,
     shell: Option<shell::Shell>,
     terminal_focus: FocusHandle,
+    terminal_scroll: ScrollHandle,
     terminal_pump: Option<Task<()>>,
     draft: Entity<TextareaState>,
     clarification: Entity<InputState>,
@@ -520,6 +522,7 @@ impl Preview {
             terminal_error: None,
             shell: None,
             terminal_focus: cx.focus_handle(),
+            terminal_scroll: ScrollHandle::new(),
             terminal_pump: None,
             draft,
             clarification,
@@ -1472,6 +1475,15 @@ impl Render for Preview {
             .text_color(ink.fg)
             .font_family(self.config.appearance.text_font.clone())
             .text_size(px(self.config.appearance.ui_size))
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, _| {
+                terminal_debug(format!(
+                    "root_key key={:?} char={:?} term_focused={} terminal_open={}",
+                    event.keystroke.key,
+                    event.keystroke.key_char,
+                    this.terminal_focus.is_focused(window),
+                    this.terminal_open,
+                ));
+            }))
             .when(self.sidebar && !self.settings, |this| {
                 this.child(self.sidebar(cx))
             })
@@ -1565,10 +1577,15 @@ impl Preview {
                     .shadow_sm()
                     .child(
                         h_flex()
+                            .id("side-head")
                             .h(px(40.))
                             .px_3()
                             .items_center()
                             .gap_1()
+                            // 与顶栏一致：这里按下拖动整窗时不启动文字选择。
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                BaseGlobalState::suppress_text_selection(cx);
+                            })
                             .child(
                                 div()
                                     .text_sm()
@@ -1762,7 +1779,13 @@ impl Preview {
                 };
                 let text = shell.screen();
                 if text != this.terminal_text {
+                    terminal_debug(format!(
+                        "pump text_len={} tail={:?}",
+                        text.len(),
+                        text.chars().rev().take(80).collect::<String>().chars().rev().collect::<String>()
+                    ));
                     this.terminal_text = text;
+                    this.terminal_scroll.scroll_to_bottom();
                     cx.notify();
                 }
                 true
@@ -1826,6 +1849,7 @@ impl Preview {
                     .min_h_0()
                     .p_3()
                     .overflow_y_scroll()
+                    .track_scroll(&self.terminal_scroll)
                     .font_family(self.config.appearance.terminal_font.clone())
                     .text_size(px(self.config.appearance.terminal_size))
                     .track_focus(&self.terminal_focus)
@@ -1835,12 +1859,21 @@ impl Preview {
                             window.focus(&this.terminal_focus, cx);
                         }),
                     )
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, _| {
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        terminal_debug(format!(
+                            "key_down key={:?} char={:?} mods={:?} focused={} pending={}",
+                            event.keystroke.key,
+                            event.keystroke.key_char,
+                            event.keystroke.modifiers,
+                            this.terminal_focus.is_focused(window),
+                            window.has_pending_keystrokes(),
+                        ));
                         if let Some(shell) = this.shell.as_ref() {
                             if let Some(bytes) = shell_bytes(event) {
                                 shell.write(&bytes);
                             }
                         }
+                        cx.stop_propagation();
                     }))
                     .child(text),
             )
@@ -1928,12 +1961,18 @@ impl Preview {
         };
 
         h_flex()
+            .id("caption")
             .h(px(40.))
             .w_full()
             .min_w_0()
             .flex_shrink_0()
             .items_center()
             .pl_2()
+            // 顶栏按下不参与窗口级文字选择：原生拖动期间收不到 mouse up，
+            // 选择层会残留选中状态并跟随后续鼠标移动。
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                BaseGlobalState::suppress_text_selection(cx);
+            })
             .child(lead)
             .when(self.selected_workspace().is_some(), |this| {
                 this.child(
@@ -2456,6 +2495,22 @@ fn open_workspace(target: OpenTarget, dir: &std::path::Path) -> std::io::Result<
         }
     }
     Ok(())
+}
+
+/// 临时诊断：只有设置了 HIKARI_TERMINAL_DEBUG 才写日志。
+pub(crate) fn terminal_debug(message: impl AsRef<str>) {
+    if std::env::var_os("HIKARI_TERMINAL_DEBUG").is_none() {
+        return;
+    }
+    use std::io::Write as _;
+    let path = std::env::temp_dir().join("hikari-terminal.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{}", message.as_ref());
+    }
 }
 
 fn shell_bytes(event: &KeyDownEvent) -> Option<Vec<u8>> {
@@ -3518,7 +3573,8 @@ fn field(label: &'static str, input: impl IntoElement, theme: ThemeColor) -> imp
 }
 
 fn main() {
-    application().with_assets(assets::Assets).run(|cx| {
+    // 用全量图标集：默认子集缺少 square-stop / send 等图标，缺图标时 svg 会静默留白。
+    application().with_assets(assets::AllAssets).run(|cx| {
         init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
 

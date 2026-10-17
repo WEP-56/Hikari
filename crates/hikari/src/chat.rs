@@ -509,8 +509,8 @@ impl Preview {
             return div().into_any_element();
         };
         let key = format!("tool-{}-{id}-{line_idx}", talk.id);
-        let default = *error;
-        let open = talk.view.open(&key, default);
+        // 失败的调用也保持收起，需要看输出时手动展开即可。
+        let open = talk.view.open(&key, false);
         let presentation = tool_presentation(name, args);
         let status = if *running {
             "正在"
@@ -533,7 +533,7 @@ impl Preview {
             key,
             label,
             presentation.icon,
-            default,
+            false,
             color,
             cx,
         ));

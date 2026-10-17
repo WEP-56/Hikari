@@ -244,6 +244,11 @@ impl Preview {
     }
 
     pub(super) fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        crate::terminal_debug(format!(
+            "toggle_terminal available={} open_before={}",
+            self.workspace_available(),
+            self.terminal_open
+        ));
         if !self.workspace_available() {
             return;
         }
@@ -251,6 +256,10 @@ impl Preview {
         if self.terminal_open {
             self.ensure_shell(cx);
             window.focus(&self.terminal_focus, cx);
+            crate::terminal_debug(format!(
+                "toggle_terminal focused={}",
+                self.terminal_focus.is_focused(window)
+            ));
         }
         cx.notify();
     }

@@ -16,6 +16,7 @@ fn run_ripgrep(path: &Path, args: &Value, root: &Path, abort: &AtomicBool) -> Re
     let Some(pattern) = args.get("pattern").and_then(Value::as_str) else { return Ok(None); };
     let Some(program) = resolve_rg() else { return Ok(None); };
     let mut command = Command::new(program);
+    hide_console_window(&mut command);
     command.args(["-n", "--no-heading", "--color", "never", "--max-count", "200", "--hidden", "--no-ignore"]);
     for excluded in ["!.git", "!target", "!node_modules", "!.hikari"] {
         command.args(["-g", excluded]);
@@ -103,11 +104,27 @@ fn resolve_rg() -> Option<PathBuf> {
     }
     candidates.into_iter().find(|path| path.is_file()).or_else(|| {
         let probe = if cfg!(windows) { "where" } else { "which" };
-        let output = Command::new(probe).arg("rg").output().ok()?;
+        let mut command = Command::new(probe);
+        hide_console_window(&mut command);
+        let output = command.arg("rg").output().ok()?;
         if !output.status.success() { return None; }
         String::from_utf8(output.stdout).ok()?.lines().next().map(PathBuf::from)
     })
 }
+
+// 后台调用控制台程序（rg / where.exe）时不创建控制台窗口，否则 release 下会闪一下黑框。
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(windows)]
+fn hide_console_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_console_window(_command: &mut Command) {}
+
 impl Tool for FileTool {
     fn name(&self) -> &str {
         self.kind
