@@ -1,6 +1,6 @@
 ; Hikari Windows 安装包（Inno Setup 6）
 ;
-; 版本号由 tag 注入：ISCC.exe /DAppVersion=0.2.0 installer\hikari.iss
+; 版本号由 tag 注入：ISCC.exe /DAppVersion=0.3.1 installer\hikari.iss
 ; 未注入时（本地手工编译）回退到下面的默认值。
 ;
 ; 本地验证：
@@ -8,7 +8,7 @@
 ; 产物输出到 target\setup\。
 
 #ifndef AppVersion
-  #define AppVersion "0.2.0"
+  #define AppVersion "0.3.1"
 #endif
 
 #define AppName "Hikari"

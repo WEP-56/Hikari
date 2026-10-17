@@ -8,6 +8,7 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 pub struct Shell {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     screen: Arc<Mutex<String>>,
+    io_error: Arc<Mutex<Option<String>>>,
     // ConPTY 的所有权在 master 手里：master 一旦被释放就会 ClosePseudoConsole，
     // 子进程随之结束、读取线程立刻读到 EOF，界面就会一直停在“正在打开命令行…”。
     _master: Box<dyn MasterPty + Send>,
@@ -38,12 +39,31 @@ impl Shell {
         let writer = master.take_writer().map_err(|err| err.to_string())?;
         let screen = Arc::new(Mutex::new(String::new()));
         let screen_thread = screen.clone();
+        let io_error = Arc::new(Mutex::new(None));
+        let reader_error = io_error.clone();
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => {
+                        crate::terminal_debug("pty_read EOF");
+                        *reader_error.lock().unwrap() =
+                            Some("终端输出流已关闭，shell 可能已经退出。".into());
+                        break;
+                    }
+                    Err(err) => {
+                        if err.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        crate::terminal_debug(format!("pty_read error={err}"));
+                        *reader_error.lock().unwrap() = Some(format!("读取终端失败：{err}"));
+                        break;
+                    }
                     Ok(n) => {
+                        crate::terminal_debug(format!(
+                            "pty_read bytes={n} raw={:?}",
+                            String::from_utf8_lossy(&buf[..n])
+                        ));
                         let text = String::from_utf8_lossy(&buf[..n]);
                         let mut guard = screen_thread.lock().unwrap();
                         guard.push_str(&strip_ansi(&text));
@@ -58,17 +78,33 @@ impl Shell {
         Ok(Self {
             writer: Arc::new(Mutex::new(writer)),
             screen,
+            io_error,
             _master: master,
             _child: child,
         })
     }
 
-    pub fn write(&self, bytes: &[u8]) {
+    pub fn write(&self, bytes: &[u8]) -> Result<(), String> {
         crate::terminal_debug(format!("shell_write {:?}", String::from_utf8_lossy(bytes)));
-        if let Ok(mut writer) = self.writer.lock() {
-            let _ = writer.write_all(bytes);
-            let _ = writer.flush();
+        let result: Result<(), String> = (|| {
+            let mut writer = self
+                .writer
+                .lock()
+                .map_err(|_| "终端写入锁不可用".to_string())?;
+            writer
+                .write_all(bytes)
+                .and_then(|_| writer.flush())
+                .map_err(|err| format!("写入终端失败：{err}"))
+        })();
+        if let Err(err) = &result {
+            crate::terminal_debug(format!("shell_write error={err}"));
+            *self.io_error.lock().unwrap() = Some(err.clone());
         }
+        result
+    }
+
+    pub fn io_error(&self) -> Option<String> {
+        self.io_error.lock().unwrap().clone()
     }
 
     pub fn screen(&self) -> String {
@@ -141,7 +177,7 @@ mod tests {
     fn typing_reaches_the_shell() {
         let shell = Shell::spawn(&std::env::temp_dir()).expect("spawn shell");
         std::thread::sleep(std::time::Duration::from_millis(600));
-        shell.write(b"echo hikari-probe\r");
+        shell.write(b"echo hikari-probe\r").expect("write probe command");
         let mut text = String::new();
         for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -157,7 +193,7 @@ mod tests {
         );
         // 第二轮：模拟用户在终端里继续输入。
         std::thread::sleep(std::time::Duration::from_millis(2000));
-        shell.write(b"abc\r");
+        shell.write(b"abc\r").expect("write second command");
         let mut second = String::new();
         for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(100));

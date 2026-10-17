@@ -1778,6 +1778,11 @@ impl Preview {
                     return false;
                 };
                 let text = shell.screen();
+                let io_error = shell.io_error();
+                if io_error != this.terminal_error {
+                    this.terminal_error = io_error;
+                    cx.notify();
+                }
                 if text != this.terminal_text {
                     terminal_debug(format!(
                         "pump text_len={} tail={:?}",
@@ -1798,7 +1803,7 @@ impl Preview {
 
     fn terminal_panel(&self, ink: Ink, cx: &mut Context<Self>) -> impl IntoElement {
         let text = if let Some(err) = &self.terminal_error {
-            format!("终端没有打开。\n{err}")
+            format!("{}\n\n终端错误：{err}", self.terminal_text)
         } else if self.terminal_text.is_empty() {
             "正在打开命令行…".to_string()
         } else {
@@ -1870,7 +1875,12 @@ impl Preview {
                         ));
                         if let Some(shell) = this.shell.as_ref() {
                             if let Some(bytes) = shell_bytes(event) {
-                                shell.write(&bytes);
+                                if let Err(err) = shell.write(&bytes) {
+                                    this.terminal_error = Some(err);
+                                    cx.notify();
+                                }
+                            } else {
+                                terminal_debug("key_down unmapped: no bytes sent to PTY");
                             }
                         }
                         cx.stop_propagation();
